@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-subscription"
+version = "0.1.0"
+description = "透過官方 Claude Code CLI，用訂閱方案或 API key 在程式裡呼叫 Claude（零第三方相依）"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []        # 純標準函式庫，無任何相依
+
+[project.scripts]
+claude-sub = "claude_subscription:_main"   # 安裝後可直接用 `claude-sub` 指令
+
+[tool.setuptools]
+py-modules = ["claude_subscription"]
