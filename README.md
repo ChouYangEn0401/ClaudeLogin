@@ -5,6 +5,20 @@
 請求一律「經過官方 Claude Code」，用的就是該台電腦上 Claude Code 設定的登入方式。
 零第三方相依套件，跨 Windows / macOS / Linux。
 
+## 這個工具能做 / 不能做
+
+| 能 ✅ | 不能 ❌ |
+|------|--------|
+| 文字進、文字出（問答、整理、分類、抽取） | **生成圖片**（這條路是文字模型，不產圖。需要的話得另接 API 的圖像模型） |
+| 讀入文字檔當輸入（`--attach`，可多檔） | 直接「看」圖片/PDF 內容（headless 文字管線不支援影像輸入） |
+| 強制結構化 JSON 輸出（`--json-schema`） | |
+| 把答案存成檔案（`--output-file`） | |
+| 單次呼叫，或多輪 session 延續對話（記得上下文） | |
+| 給程式接（`--format json`，含 `session_id`、`cost`） | |
+
+> 想「產生檔案」其實可行：開啟工具（`--tools default`）後讓 Claude 用 Write 工具在資料夾寫檔，
+> 但那會變貴也較複雜，現階段建議用 `--output-file` 存它回的文字即可。
+
 ---
 
 ## ⚠️ 先讀：三個你必須知道的重點
@@ -68,8 +82,13 @@ python claude_subscription.py --check
 ```
 會檢查：找不找得到 `claude`、登入狀態、並實測一次極小呼叫。全部 ✓ 就能用了。
 
-> **可選：用 pip 安裝成指令。** 連同 `pyproject.toml` 一起給對方後，在資料夾裡執行
-> `pip install .`，就會多一個全域指令 `claude-sub`（= `python claude_subscription.py`）。
+**第 4 步：讓它「隨處可用」（三選一）**
+
+1. **啟動器腳本（最簡單）**：把本資料夾加入系統 PATH，之後任何位置都能用：
+   - Windows：`claude-ask "你的提示"`（用 `claude-ask.bat`）
+   - macOS / Linux：`./claude-ask.sh "你的提示"`（先 `chmod +x claude-ask.sh`）
+2. **pip 安裝成全域指令**：在資料夾裡 `pip install .`，得到指令 `claude-sub`（= `python claude_subscription.py`）。
+3. **直接呼叫**：`python /路徑/claude_subscription.py ...`。
 
 > **登入方式對照**：`--auth subscription`（預設，走訂閱）／`--auth apikey`（走 API key 按量計費）
 > ／`--auth auto`（完全照 Claude Code 既有設定，不更動環境變數）。
@@ -98,40 +117,129 @@ r = ask("把以下分類成清單：……", model="haiku", json_schema=schema, 
 data = r.data              # 已解析成 Python dict / list
 ```
 
-`ask()` 主要參數：
+多輪對話（session 延續）：
+
+```python
+# 第一輪：開新對話，記住 session_id
+r1 = ask("我等下要問你問題，先記住我的訂單編號是 A-12345。", persist=True)
+sid = r1.session_id
+
+# 後續：用 resume 接續，Claude 記得前面說過的話
+r2 = ask("我的訂單編號是多少？", resume=sid)
+print(r2.text)   # -> A-12345
+```
+
+附帶檔案當輸入：
+
+```python
+r = ask("把這份客訴整理成一句重點與急迫度", attach=["ticket.txt"])
+```
+
+### `ask()` 完整 API
+
+簽名：`ask(prompt, *, model, system, json_schema, max_budget_usd, tools, timeout, binary, auth, attach, resume, session_id, persist, extra_args) -> ClaudeResult`
 
 | 參數 | 預設 | 說明 |
 |------|------|------|
+| `prompt` | （必填） | 提示 / 要處理的資料字串 |
 | `model` | `"haiku"` | `haiku`(最便宜) / `sonnet`(均衡) / `opus`(最強最貴) 或完整模型名 |
-| `system` | 內建精簡提示 | 系統提示；設 `None` 用 Claude Code 預設（**較貴**） |
+| `system` | 內建精簡提示 | 系統提示；設 `None` 用 Claude Code 預設（**較貴**）。延續對話時自動略過 |
 | `json_schema` | `None` | 給定後強制結構化輸出，用 `r.data` 取得 |
 | `max_budget_usd` | `None` | 單次花費上限，超過中止，保護額度 |
 | `tools` | `""` | 預設關閉所有工具（純文字進出）。要讓它讀檔/執行指令才改 |
-| `auth` | `"subscription"` | 登入方式：`subscription` / `apikey` / `auto` |
 | `timeout` | `180` | 逾時秒數 |
+| `binary` | 自動偵測 | 自訂 claude 執行檔路徑 |
+| `auth` | `"subscription"` | 登入方式：`subscription` / `apikey` / `auto` |
+| `attach` | `None` | 文字檔路徑清單，內容會附在提示前 |
+| `resume` | `None` | 要延續的 `session_id`（接續舊對話） |
+| `session_id` | `None` | 指定固定 session id 開新對話 |
+| `persist` | `False` | 保留 session 到磁碟（要日後 resume 就設 True） |
+| `extra_args` | `None` | 額外傳給 claude 的參數 list |
+
+回傳 `ClaudeResult`：
+
+| 屬性 | 說明 |
+|------|------|
+| `.text` | Claude 回的文字 |
+| `.data` | 結構化結果（有 `json_schema` 時為已解析物件；否則嘗試解析 `.text`） |
+| `.structured_output` | 用 `json_schema` 時的結構化資料 |
+| `.cost_usd` | 本次花費（從額度/餘額扣） |
+| `.session_id` | 本次 session id（傳給下次 `resume` 即可延續） |
+| `.num_turns` / `.duration_ms` / `.raw` | 輪數 / 耗時 / 完整原始 JSON |
+
+失敗時丟 `ClaudeError`（或找不到執行檔時 `FileNotFoundError`）。
 
 ---
 
 ## 用法二：命令列（任何語言都能 shell out 呼叫）
 
-```powershell
-# 直接帶提示
-python claude_subscription.py --model haiku "把這段話濃縮成一句：……" --show-cost
+下面用 `claude-ask` 代表啟動器（= `python claude_subscription.py` 或 `claude-sub`）。
 
-# 從檔案讀提示（Windows 上傳中文最穩定，避開 PowerShell 管線編碼問題）
-python claude_subscription.py --prompt-file input.txt --json-schema-file schema.json --show-cost
+```bash
+# 直接帶提示
+claude-ask --model haiku "把這段話濃縮成一句：……" --show-cost
+
+# 讀檔當輸入（可多個 --attach），輸出結構化 JSON 並存檔
+claude-ask --attach data.txt --json-schema-file schema.json --output-file out.json
+
+# 給程式接：--format json 一次拿到答案 + session_id + 花費
+claude-ask --format json "分類這句的情緒：這服務爛透了"
+
+# 多輪對話：先開 session（記下回傳的 session_id），再 resume 接續
+claude-ask --session 11111111-1111-1111-1111-111111111111 "記住我的代號是 X9"
+claude-ask --resume  11111111-1111-1111-1111-111111111111 "我的代號是什麼？"
 
 # 走 API key（按量計費）而非訂閱
-python claude_subscription.py --auth apikey "整理這段：……"
+claude-ask --auth apikey "整理這段：……"
 
 # 新電腦自我診斷 / 查偵測到的執行檔
-python claude_subscription.py --check
-python claude_subscription.py --which
+claude-ask --check
+claude-ask --which
 ```
 
-- 結果印到 **stdout**（用了 `--json-schema-file` 時輸出結構化 JSON）。
-- 加 `--show-cost` 會把花費印到 **stderr**（不污染 stdout，方便其他程式 pipe）。
-- 你的非 Python 程式（Node / C# / Go…）只要 `spawn` 這個指令、讀 stdout 即可。
+### CLI 參數總覽
+
+| 參數 | 說明 |
+|------|------|
+| `prompt`（位置參數） | 提示文字；中文可直接放在引號內（argv 在 Windows 也安全） |
+| `--prompt-file FILE` | 從檔案讀提示（UTF-8，可含 BOM） |
+| `--attach FILE` | 附帶文字檔當輸入，可重複多次 |
+| `--model` | `haiku`(預設) / `sonnet` / `opus` 或完整模型名 |
+| `--system` / `--no-system` | 自訂系統提示 / 改用 Claude Code 預設（較貴） |
+| `--json-schema-file FILE` | 強制結構化 JSON 輸出 |
+| `--max-budget-usd N` | 單次花費上限 |
+| `--tools` | 預設 `""`(全關)；`default`(全開)；或 `Read,Bash` |
+| `--auth` | `subscription`(預設) / `apikey` / `auto` |
+| `--resume SESSION_ID` | 延續指定對話 |
+| `--continue` | 延續本資料夾最近一次對話 |
+| `--session UUID` | 指定固定 session id 開新對話（方便日後 resume） |
+| `--persist` | 保留 session 到磁碟（單次預設不保留） |
+| `--format` | `text`(預設) / `json`（含 `session_id`、`cost`） |
+| `--output-file FILE` | 把答案另存到檔案 |
+| `--show-cost` | 在 stderr 印出花費 |
+| `--check` / `--which` | 自我診斷 / 印出偵測到的執行檔 |
+
+**輸出約定（給其他程式接的關鍵）**：
+- 答案一律印到 **stdout**；診斷（花費、session）印到 **stderr**——所以 pipe stdout 永遠拿到乾淨結果。
+- `--format json` 時 stdout 是一個 JSON 物件：`{"text", "structured_output", "session_id", "cost_usd", "model", "duration_ms"}`。
+- 結束碼：成功 `0`、呼叫失敗 `1`、找不到執行檔 `2`、未登入 `3`。
+
+### 範例：用 Node.js（或任何語言）接
+
+```js
+const { execFileSync } = require("node:child_process");
+
+function ask(prompt, { sessionId } = {}) {
+  const args = ["claude_subscription.py", "--format", "json", prompt];
+  if (sessionId) args.push("--resume", sessionId);
+  const out = execFileSync("python", args, { encoding: "utf-8" });
+  return JSON.parse(out);   // { text, session_id, cost_usd, ... }
+}
+
+const r1 = ask("記住我的訂單編號 A-12345");
+const r2 = ask("我的訂單編號是？", { sessionId: r1.session_id });
+console.log(r2.text);       // -> A-12345
+```
 
 ---
 
@@ -162,6 +270,8 @@ python claude_subscription.py --which
 ## 檔案
 
 - `claude_subscription.py` — 核心函式庫 + 命令列工具（**發佈必備，且零相依套件**）。
-- `example_usage.py` — 三個資料整理範例（重點整理 / 結構化 JSON / 批次分類）。
+- `claude-ask.bat` — Windows 啟動器（加入 PATH 後可在任何位置用 `claude-ask`）。
+- `claude-ask.sh` — macOS / Linux 啟動器。
+- `example_usage.py` — 資料整理範例（重點整理 / 結構化 JSON / 批次分類 / session 延續）。
 - `pyproject.toml` — 選配，讓對方可 `pip install .` 並取得 `claude-sub` 指令。
 - `README.md` — 本說明。

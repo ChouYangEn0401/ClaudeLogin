@@ -184,6 +184,18 @@ class ClaudeError(RuntimeError):
 _DEFAULT_SYSTEM = "你是一個精準的資料處理助手，只輸出被要求的內容，不要多餘解釋。"
 
 
+def _read_attachments(paths: list) -> str:
+    """把多個文字檔讀進來，包成帶檔名標頭的區塊字串。"""
+    blocks = []
+    for p in paths:
+        fp = Path(p)
+        if not fp.exists():
+            raise FileNotFoundError(f"附檔不存在：{fp}")
+        content = fp.read_text(encoding="utf-8-sig")
+        blocks.append(f"===== 檔案：{fp.name} =====\n{content}\n===== 檔案結束：{fp.name} =====")
+    return "\n\n".join(blocks)
+
+
 # --------------------------------------------------------------------------- #
 # 3. 核心呼叫函式
 # --------------------------------------------------------------------------- #
@@ -198,6 +210,10 @@ def ask(
     timeout: int = 180,
     binary: Optional[str] = None,
     auth: str = "subscription",
+    attach: Optional[list] = None,
+    resume: Optional[str] = None,
+    session_id: Optional[str] = None,
+    persist: bool = False,
     extra_args: Optional[list[str]] = None,
 ) -> ClaudeResult:
     """送一個提示給 Claude（透過官方 claude CLI），回傳 ClaudeResult。
@@ -214,15 +230,26 @@ def ask(
     binary        : 自訂 claude 執行檔路徑（預設自動偵測）。
     auth          : 'subscription'(預設,走訂閱OAuth) / 'apikey'(用ANTHROPIC_API_KEY) /
                     'auto'(照 Claude Code 既有順序，不更動)。
+    attach        : 要附帶的文字檔路徑清單；內容會以分隔標頭附在提示前面。
+    resume        : 要延續的 session id（接續先前對話）。會自動開啟 session 保存。
+    session_id    : 指定一個固定的 session id（UUID）來開新對話，方便日後 resume。
+    persist       : True 時保留 session 到磁碟（resume/session_id 會自動視為 True）。
+                    預設 False＝單次呼叫、用完即丟。
     extra_args    : 額外要傳給 claude 的參數（list of str）。
+
+    回傳的 ClaudeResult.session_id 可用於下一次 resume，達成多輪對話延續。
 
     例外
     ----
     ClaudeError       : Claude 回報錯誤、子程序失敗、或 auth='apikey' 卻沒有 API key。
-    FileNotFoundError : 找不到 claude 執行檔。
+    FileNotFoundError : 找不到 claude 執行檔（或附檔不存在）。
     ValueError        : auth 模式不合法。
     """
     claude = binary or find_claude_binary()
+
+    # 附檔：把每個檔案內容包進帶標頭的區塊，附在提示前面。
+    if attach:
+        prompt = _read_attachments(attach) + "\n" + prompt
 
     cmd: list[str] = [
         claude,
@@ -233,9 +260,17 @@ def ask(
         model,
         "--tools",
         tools,
-        "--no-session-persistence",
     ]
-    if system is not None:
+    # session 延續：有 resume / session_id / persist 時才保留 session。
+    want_persist = persist or bool(resume) or bool(session_id)
+    if not want_persist:
+        cmd.append("--no-session-persistence")
+    if resume:
+        cmd += ["--resume", resume]
+    elif session_id:
+        cmd += ["--session-id", session_id]
+    # resume 時 session 已有系統提示，不再覆寫，避免衝突。
+    if system is not None and not resume:
         cmd += ["--system-prompt", system]
     if json_schema is not None:
         cmd += ["--json-schema", json.dumps(json_schema, ensure_ascii=False)]
@@ -379,6 +414,13 @@ def _main(argv: Optional[list[str]] = None) -> int:
         "--prompt-file",
         help="從檔案讀取提示（UTF-8，可含 BOM）。Windows 上傳中文最穩定的方式。",
     )
+    parser.add_argument(
+        "--attach",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="附帶一個文字檔當輸入內容（可重複多次帶多個檔）。",
+    )
     parser.add_argument("--model", default="haiku", help="haiku(預設)/sonnet/opus 或完整模型名")
     parser.add_argument("--system", default=None, help="系統提示（覆寫內建預設）")
     parser.add_argument("--no-system", action="store_true", help="使用 Claude Code 預設系統提示（較貴）")
@@ -393,6 +435,20 @@ def _main(argv: Optional[list[str]] = None) -> int:
         default="subscription",
         help="登入方式：subscription(預設) / apikey / auto",
     )
+    # ── session 延續 ──
+    parser.add_argument("--resume", metavar="SESSION_ID", help="延續指定 session id 的對話")
+    parser.add_argument(
+        "--continue", dest="continue_last", action="store_true",
+        help="延續這個資料夾最近一次對話（等同 claude --continue）",
+    )
+    parser.add_argument("--session", metavar="UUID", help="指定固定 session id 開新對話，方便日後 --resume")
+    parser.add_argument("--persist", action="store_true", help="保留 session 到磁碟（單次預設不保留）")
+    # ── 輸出 ──
+    parser.add_argument(
+        "--format", choices=("text", "json"), default="text",
+        help="text(預設,只印答案) / json(印含 session_id、cost 的完整物件，方便程式接)",
+    )
+    parser.add_argument("--output-file", metavar="FILE", help="把答案另存到檔案（UTF-8）")
     parser.add_argument("--show-cost", action="store_true", help="在 stderr 印出本次花費")
     parser.add_argument(
         "--which", action="store_true", help="只印出偵測到的 claude 執行檔路徑後結束"
@@ -431,13 +487,19 @@ def _main(argv: Optional[list[str]] = None) -> int:
         # utf-8-sig 可同時容忍有/無 BOM 的檔（Windows 編輯器常加 BOM）
         schema = json.loads(Path(args.json_schema_file).read_text(encoding="utf-8-sig"))
 
-    # --system 優先；否則 --no-system 用內建預設(None)；否則用 ask() 的預設值
-    if args.system is not None:
-        system_arg: Any = args.system
+    # 延續對話時，session 已有系統提示，不再覆寫。
+    continuing = bool(args.resume) or args.continue_last
+    if continuing:
+        system_arg: Any = None
+    elif args.system is not None:
+        system_arg = args.system
     elif args.no_system:
         system_arg = None
     else:
         system_arg = _DEFAULT_SYSTEM
+
+    # --continue 透過 extra_args 傳給 claude，並需保留 session。
+    extra = ["--continue"] if args.continue_last else None
 
     try:
         result = ask(
@@ -450,26 +512,55 @@ def _main(argv: Optional[list[str]] = None) -> int:
             timeout=args.timeout,
             binary=args.binary,
             auth=args.auth,
+            attach=args.attach,
+            resume=args.resume,
+            session_id=args.session,
+            persist=args.persist or args.continue_last,
+            extra_args=extra,
         )
     except (ClaudeError, FileNotFoundError, ValueError) as e:
         print(f"[claude_subscription] 錯誤：{e}", file=sys.stderr)
         return 1
 
-    # 結果到 stdout（純淨，方便 pipe）；花費到 stderr。
-    # 有用 json_schema 時，輸出結構化 JSON 而非口語確認句。
-    if result.structured_output is not None:
+    # 決定要輸出的內容。
+    if args.format == "json":
+        # 完整物件，方便程式接（含 session_id 供延續對話用）。
+        out = json.dumps(
+            {
+                "text": result.text,
+                "structured_output": result.structured_output,
+                "session_id": result.session_id,
+                "cost_usd": result.cost_usd,
+                "model": args.model,
+                "duration_ms": result.duration_ms,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    elif result.structured_output is not None:
+        # 有用 json_schema 時，輸出結構化 JSON 而非口語確認句。
         out = json.dumps(result.structured_output, ensure_ascii=False, indent=2)
     else:
         out = result.text
+
+    # 存檔（可選）。
+    if args.output_file:
+        Path(args.output_file).write_text(out, encoding="utf-8")
+
+    # 結果到 stdout（純淨，方便 pipe）。
     sys.stdout.write(out)
     if not out.endswith("\n"):
         sys.stdout.write("\n")
-    if args.show_cost:
-        print(
-            f"[claude_subscription] 本次花費 ${result.cost_usd:.6f}｜模型 {args.model}"
-            f"｜{result.duration_ms} ms（從你的每月 Agent SDK 額度扣）",
-            file=sys.stderr,
+
+    # 診斷資訊一律到 stderr（不污染 stdout）。
+    if args.show_cost or args.persist or args.session or continuing:
+        msg = (
+            f"[claude_subscription] 花費 ${result.cost_usd:.6f}｜模型 {args.model}"
+            f"｜{result.duration_ms} ms"
         )
+        if result.session_id:
+            msg += f"｜session={result.session_id}"
+        print(msg, file=sys.stderr)
     return 0
 
 

@@ -70,10 +70,21 @@ def demo_3_批次處理():
     print(f"（本批共 {len(items)} 筆，合計花費 ${total:.5f}）\n")
 
 
+def demo_4_session延續():
+    """多輪對話：第一輪記住資訊，第二輪 resume 接續，驗證 Claude 記得上下文。"""
+    print("【示範4：session 延續對話】")
+    r1 = ask("記住一個資訊：我的專案代號是『獵戶座』。只回覆 OK。", persist=True)
+    print(f"  第一輪 -> {r1.text.strip()}（session={r1.session_id[:8]}…）")
+    r2 = ask("我的專案代號是什麼？只回代號。", resume=r1.session_id)
+    print(f"  第二輪 -> {r2.text.strip()}")
+    print(f"（合計花費 ${r1.cost_usd + r2.cost_usd:.5f}）\n")
+
+
 if __name__ == "__main__":
     try:
         demo_1_純文字整理()
         demo_2_結構化JSON()
         demo_3_批次處理()
+        demo_4_session延續()
     except ClaudeError as e:
         print(f"呼叫失敗：{e}")
