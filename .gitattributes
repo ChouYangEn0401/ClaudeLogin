@@ -1,0 +1,7 @@
+# Shell 腳本必須用 LF，否則在 Linux/mac 上 shebang 會失效
+*.sh text eol=lf
+# Windows 批次檔用 CRLF
+*.bat text eol=crlf
+# Python / 文件交由 git 正常處理
+*.py text
+*.md text
