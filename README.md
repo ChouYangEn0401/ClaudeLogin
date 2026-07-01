@@ -21,6 +21,36 @@
 
 ---
 
+## ⚡ 快速整合（給另一支程式，3 種擇一）
+
+> 前提：那台電腦已裝官方 Claude Code 並登入（見下方「新電腦設定」）。先跑一次 `--check` 確認。
+
+**① 另一支程式是 Python → 直接 import（最簡單）**
+```python
+# 若 claude_subscription.py 不在同資料夾，先 pip install . 或加 sys.path
+from claude_subscription import ask
+r = ask("把這段整理成三點重點：……")     # 單次
+print(r.text, r.cost_usd)
+```
+
+**② 任何語言 → 呼叫 CLI，讀 `--format json`（stdout 是乾淨 JSON）**
+```bash
+python claude_subscription.py --format json "分類情緒：這服務爛透了"
+# stdout -> {"text":"negative","session_id":"…","cost_usd":0.0012,...}
+```
+> 可直接參考 `integration_sample.py`（一個 `call()` 函式，複製即用，含單次與多輪）。
+
+**③ 想要「一個指令」→ 用啟動器**（把資料夾加入 PATH）
+```bash
+claude-ask "你的提示"            # Windows: claude-ask.bat；mac/Linux: ./claude-ask.sh
+```
+
+**拿結果的約定**：答案永遠在 **stdout**、診斷在 **stderr**；`--format json` 回傳
+`{text, structured_output, session_id, cost_usd, model, duration_ms}`；
+多輪對話把 `session_id` 帶進下一次 `--resume`（第一輪要 `--persist` 或用 `--session`）。
+
+---
+
 ## ⚠️ 先讀：三個你必須知道的重點
 
 1. **這不是無限免費算力。** 程式化呼叫會消耗你的訂閱用量 / 額度（2026 年這套計費機制
@@ -185,7 +215,8 @@ claude-ask --attach data.txt --json-schema-file schema.json --output-file out.js
 # 給程式接：--format json 一次拿到答案 + session_id + 花費
 claude-ask --format json "分類這句的情緒：這服務爛透了"
 
-# 多輪對話：先開 session（記下回傳的 session_id），再 resume 接續
+# 多輪對話：第一輪用 --session 指定 id（會自動存檔），之後用 --resume 接續
+# （或第一輪用 --persist，再從輸出的 session_id 拿去 --resume）
 claude-ask --session 11111111-1111-1111-1111-111111111111 "記住我的代號是 X9"
 claude-ask --resume  11111111-1111-1111-1111-111111111111 "我的代號是什麼？"
 
@@ -229,14 +260,15 @@ claude-ask --which
 ```js
 const { execFileSync } = require("node:child_process");
 
-function ask(prompt, { sessionId } = {}) {
+function ask(prompt, { sessionId, persist } = {}) {
   const args = ["claude_subscription.py", "--format", "json", prompt];
   if (sessionId) args.push("--resume", sessionId);
+  if (persist) args.push("--persist");          // 多輪對話第一輪要加，才會存檔
   const out = execFileSync("python", args, { encoding: "utf-8" });
   return JSON.parse(out);   // { text, session_id, cost_usd, ... }
 }
 
-const r1 = ask("記住我的訂單編號 A-12345");
+const r1 = ask("記住我的訂單編號 A-12345", { persist: true });
 const r2 = ask("我的訂單編號是？", { sessionId: r1.session_id });
 console.log(r2.text);       // -> A-12345
 ```
@@ -272,6 +304,7 @@ console.log(r2.text);       // -> A-12345
 - `claude_subscription.py` — 核心函式庫 + 命令列工具（**發佈必備，且零相依套件**）。
 - `claude-ask.bat` — Windows 啟動器（加入 PATH 後可在任何位置用 `claude-ask`）。
 - `claude-ask.sh` — macOS / Linux 啟動器。
-- `example_usage.py` — 資料整理範例（重點整理 / 結構化 JSON / 批次分類 / session 延續）。
+- `example_usage.py` — Python import 範例（重點整理 / 結構化 JSON / 批次分類 / session 延續）。
+- `integration_sample.py` — **另一支程式用 subprocess 呼叫 CLI 的範本**（複製 `call()` 即用）。
 - `pyproject.toml` — 選配，讓對方可 `pip install .` 並取得 `claude-sub` 指令。
 - `README.md` — 本說明。
