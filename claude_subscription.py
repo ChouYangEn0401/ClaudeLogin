@@ -61,6 +61,24 @@ from typing import Any, Optional
 # --------------------------------------------------------------------------- #
 # 1. 找到 claude 執行檔
 # --------------------------------------------------------------------------- #
+def _force_utf8_console() -> None:
+    """把 stdout/stderr 逼成 UTF-8。
+
+    Windows 主控台預設常是 cp950/cp936 等非 UTF-8 編碼，print ``✓``/``✗``
+    這類符號會直接丟 UnicodeEncodeError（cp950 沒收錄這些 Unicode 符號）。
+    在沒有設定 PYTHONUTF8=1 的情況下執行 ``--check`` 會整個中斷，所以在
+    輸出任何東西前先 reconfigure；沒有 reconfigure（極舊版本/被重導向的
+    非標準 stream）就直接放棄，不影響原本行為。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def _install_hint() -> str:
     """依作業系統回傳安裝 / 登入指引。"""
     if platform.system() == "Windows":
@@ -345,6 +363,7 @@ def ask(
 # --------------------------------------------------------------------------- #
 def check_setup(auth: str = "subscription", do_ping: bool = True) -> int:
     """檢查本機環境並印出指引；回傳 0 代表可用、非 0 代表需處理。"""
+    _force_utf8_console()
     print("=== Claude 訂閱工具 — 環境檢查 ===")
     print(f"OS: {platform.system()} / Python {platform.python_version()}")
 
@@ -402,6 +421,7 @@ def check_setup(auth: str = "subscription", do_ping: bool = True) -> int:
 # 5. 命令列介面（讓任何語言都能 shell out 呼叫）
 # --------------------------------------------------------------------------- #
 def _main(argv: Optional[list[str]] = None) -> int:
+    _force_utf8_console()
     parser = argparse.ArgumentParser(
         description="用 Claude Code 訂閱方案呼叫 Claude（非按量 API）。"
     )
