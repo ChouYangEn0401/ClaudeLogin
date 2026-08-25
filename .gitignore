@@ -6,7 +6,6 @@ build/
 dist/
 
 # 虛擬環境
-.vemv/
 .venv/
 venv/
 env/
