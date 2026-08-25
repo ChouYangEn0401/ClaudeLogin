@@ -1,17 +1,45 @@
 [build-system]
-requires = ["setuptools>=61"]
+# setuptools>=77 才支援 PEP 639 的 SPDX license 表示法（license = "MIT"）
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-subscription"
-version = "0.1.0"
+dynamic = ["version"]          # 版本號的唯一真實來源是 claude_subscription.__version__
 description = "透過官方 Claude Code CLI，用訂閱方案或 API key 在程式裡呼叫 Claude（零第三方相依）"
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = []        # 純標準函式庫，無任何相依
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "629SandBoxEntity" }]
+keywords = ["claude", "anthropic", "claude-code", "cli", "llm", "subscription"]
+dependencies = []              # 純標準函式庫，無任何相依
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/ChouYangEn0401/ClaudeLogin"
+Repository = "https://github.com/ChouYangEn0401/ClaudeLogin"
+Issues = "https://github.com/ChouYangEn0401/ClaudeLogin/issues"
 
 [project.scripts]
 claude-sub = "claude_subscription:_main"   # 安裝後可直接用 `claude-sub` 指令
 
 [tool.setuptools]
-py-modules = ["claude_subscription"]
+py-modules = ["claude_subscription"]       # 只打包這一個模組，範例與測試不進 wheel
+
+[tool.setuptools.dynamic]
+version = { attr = "claude_subscription.__version__" }
