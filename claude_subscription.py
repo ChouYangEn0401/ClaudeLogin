@@ -64,14 +64,16 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "ask",
+    "ask_stream",
     "check_setup",
     "find_claude_binary",
     "ClaudeResult",
@@ -406,6 +408,147 @@ def ask(
     FileNotFoundError   : 附檔不存在（結束碼 4）。
     ValueError          : auth 模式不合法、或附檔不是文字檔（結束碼 4）。
     """
+    claude, cmd, env, prompt = _prepare(
+        prompt, "json", model=model, system=system, json_schema=json_schema,
+        max_budget_usd=max_budget_usd, tools=tools, permission_mode=permission_mode, binary=binary,
+        auth=auth, attach=attach, resume=resume, session_id=session_id, persist=persist,
+        extra_args=extra_args)
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",  # claude 若吐出非 UTF-8 位元組，不要蓋掉真正的錯誤原因
+            env=env,
+            cwd=cwd,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise ClaudeError(f"呼叫逾時（{timeout}s）。") from e
+    except OSError as e:  # 執行檔在解析後又消失、或路徑不可執行
+        raise ClaudeNotFoundError(f"無法執行 {claude}：{e}\n\n{_install_hint()}") from e
+
+    if proc.returncode != 0:
+        _raise_process_failure(proc.returncode, proc.stderr, proc.stdout)
+
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise ClaudeError(f"無法解析 claude 的 JSON 輸出。\nstdout:\n{proc.stdout[:2000]}") from e
+    return _result_from(payload, proc.stdout, proc.stderr)
+
+
+def ask_stream(
+    prompt: str,
+    on_event: Callable[[dict], None],
+    *,
+    include_partial: bool = False,
+    model: str = "haiku",
+    system: Optional[str] = _DEFAULT_SYSTEM,
+    json_schema: Optional[dict] = None,
+    max_budget_usd: Optional[float] = None,
+    tools: str = "",
+    permission_mode: Optional[str] = None,
+    timeout: int = 180,
+    binary: Optional[str] = None,
+    auth: str = "subscription",
+    attach: Optional[list] = None,
+    resume: Optional[str] = None,
+    session_id: Optional[str] = None,
+    persist: bool = False,
+    cwd: Optional[str] = None,
+    extra_args: Optional[list[str]] = None,
+) -> ClaudeResult:
+    """跟 ask() 一樣（參數、例外、回傳值都相同），但過程中的每一個事件都先交給 on_event。
+
+    用 ``--output-format stream-json --verbose``：claude 一行吐一個 JSON 事件——
+    ``{"type": "system", "subtype": "init", …}``、``{"type": "assistant", "message": {"content": [
+    {"type": "thinking"|"text"|"tool_use", …}]}}``、``{"type": "user", "message": {"content": [
+    {"type": "tool_result", …}]}}``，最後是 ``{"type": "result", …}``（欄位跟 ask() 的 JSON 一樣）。
+    include_partial=True 再加 ``--include-partial-messages``：多出 ``{"type": "stream_event", …}`` 的逐字片段。
+
+    on_event 在讀 stdout 的同一條執行緒上被呼叫；它丟出的例外不會中斷這次呼叫（只寫到 stderr）。
+    適合拿來做「AI 現在在想／在呼叫哪個工具」的即時進度顯示。
+    """
+    claude, cmd, env, prompt = _prepare(
+        prompt, "stream-json", model=model, system=system, json_schema=json_schema,
+        max_budget_usd=max_budget_usd, tools=tools, permission_mode=permission_mode, binary=binary,
+        auth=auth, attach=attach, resume=resume, session_id=session_id, persist=persist,
+        extra_args=(["--verbose"] + (["--include-partial-messages"] if include_partial else [])
+                    + list(extra_args or [])))
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            cwd=cwd,
+        )
+    except OSError as e:
+        raise ClaudeNotFoundError(f"無法執行 {claude}：{e}\n\n{_install_hint()}") from e
+
+    stderr_parts: list[str] = []
+    reader = threading.Thread(target=lambda: stderr_parts.append(proc.stderr.read() or ""), daemon=True)
+    reader.start()
+    timed_out = threading.Event()
+
+    def _kill_on_timeout():
+        timed_out.set()
+        proc.kill()
+
+    timer = threading.Timer(timeout, _kill_on_timeout)
+    timer.daemon = True
+    timer.start()
+    final: Optional[dict] = None
+    lines: list[str] = []
+    try:
+        try:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+        except OSError:
+            pass  # 子程序一啟動就死了：下面 returncode 會說明
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            lines.append(line)
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "result":
+                final = event
+            try:
+                on_event(event)
+            except Exception as cb_error:  # 進度顯示壞掉不該讓這一輪失敗
+                print(f"[claude_subscription] on_event 丟出例外（略過）：{cb_error!r}", file=sys.stderr)
+        proc.wait()
+    finally:
+        timer.cancel()
+    reader.join(5)
+    stderr = "".join(stderr_parts)
+    stdout = "\n".join(lines)
+    if timed_out.is_set():
+        raise ClaudeError(f"呼叫逾時（{timeout}s）。")
+    if final is None:
+        if proc.returncode != 0:
+            _raise_process_failure(proc.returncode, stderr, stdout)
+        raise ClaudeError(f"claude 沒有送出 result 事件。\nstdout:\n{stdout[-2000:]}")
+    return _result_from(final, stdout, stderr)
+
+
+def _prepare(prompt: str, output_format: str, *, model, system, json_schema, max_budget_usd, tools,
+             permission_mode, binary, auth, attach, resume, session_id, persist, extra_args):
+    """ask() 與 ask_stream() 共用：組 argv、處理附檔、決定子程序的憑證環境。回傳 (claude, cmd, env, prompt)。"""
     if auth not in ("subscription", "apikey", "auto"):
         raise ValueError(f"未知的 auth 模式：{auth!r}（可用：subscription / apikey / auto）")
 
@@ -419,7 +562,7 @@ def ask(
         claude,
         "-p",
         "--output-format",
-        "json",
+        output_format,
         "--model",
         model,
         "--tools",
@@ -461,43 +604,26 @@ def ask(
             )
         # 不動 base URL 類變數：走自架 proxy / Bedrock / Vertex 是合理用法。
     # auth == "auto"：完全不更動，照 Claude Code 既有的憑證優先順序。
+    return claude, cmd, env, prompt
 
-    try:
-        proc = subprocess.run(
-            cmd,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",  # claude 若吐出非 UTF-8 位元組，不要蓋掉真正的錯誤原因
-            env=env,
-            cwd=cwd,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise ClaudeError(f"呼叫逾時（{timeout}s）。") from e
-    except OSError as e:  # 執行檔在解析後又消失、或路徑不可執行
-        raise ClaudeNotFoundError(f"無法執行 {claude}：{e}\n\n{_install_hint()}") from e
 
-    if proc.returncode != 0:
-        detail = f"claude 子程序失敗 (exit {proc.returncode}).\nstderr:\n{proc.stderr.strip()}"
-        if _looks_like_auth_failure(proc.stderr, proc.stdout):
-            raise ClaudeAuthError(detail)
-        raise ClaudeError(detail)
+def _raise_process_failure(returncode: int, stderr: str, stdout: str):
+    detail = f"claude 子程序失敗 (exit {returncode}).\nstderr:\n{(stderr or '').strip()}"
+    if _looks_like_auth_failure(stderr, stdout):
+        raise ClaudeAuthError(detail)
+    raise ClaudeError(detail)
 
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError as e:
-        raise ClaudeError(f"無法解析 claude 的 JSON 輸出。\nstdout:\n{proc.stdout[:2000]}") from e
 
+def _result_from(payload: dict, stdout: str, stderr: str) -> ClaudeResult:
+    """claude 的 result JSON（json 模式整包、stream-json 模式最後一個事件）→ ClaudeResult，或丟出對應的例外。"""
     if payload.get("is_error") or payload.get("subtype") != "success":
         detail = (
             f"Claude 回報錯誤：subtype={payload.get('subtype')}, "
-            f"api_error_status={payload.get('api_error_status')}\n{proc.stdout[:1000]}"
+            f"api_error_status={payload.get('api_error_status')}\n{stdout[:1000]}"
         )
         # 401/403 是明確的認證失敗；其餘再用關鍵字啟發式判斷。
         if payload.get("api_error_status") in (401, 403) or _looks_like_auth_failure(
-            proc.stdout, proc.stderr
+            stdout, stderr
         ):
             raise ClaudeAuthError(detail)
         raise ClaudeError(detail)

@@ -682,5 +682,114 @@ class TestCheckSetup(BaseCase):
         self.assertEqual(self._check(auth="nonsense"), cs.EXIT_BAD_INPUT)
 
 
+# --------------------------------------------------------------------------- #
+# ask_stream：stream-json 一行一個事件
+# --------------------------------------------------------------------------- #
+class FakePopen:
+    """假的 claude 子程序：stdout 一行一個事件。block=True 時卡住，直到被 kill（測逾時）。"""
+
+    instances: list = []
+
+    def __init__(self, cmd, lines=(), returncode=0, err_text="", block=False, **kwargs):
+        self.cmd = cmd
+        self.kwargs = kwargs
+        self.stdin = io.StringIO()
+        self.stdin.close = lambda: None
+        self._lines = [line + "\n" for line in lines]
+        self._block = block
+        self._killed = False
+        self.returncode = None
+        self._rc = returncode
+        self.stderr = io.StringIO(err_text)
+        FakePopen.instances.append(self)
+
+    @property
+    def stdout(self):
+        import time as _t
+        for line in self._lines:
+            yield line
+        while self._block and not self._killed:
+            _t.sleep(0.01)
+
+    def wait(self, timeout=None):
+        self.returncode = -9 if self._killed else self._rc
+        return self.returncode
+
+    def kill(self):
+        self._killed = True
+
+
+STREAM = [
+    json.dumps({"type": "system", "subtype": "init", "session_id": "s-1", "tools": ["mcp__clawbot__remind__list"]}),
+    json.dumps({"type": "assistant", "message": {"content": [{"type": "thinking", "thinking": "要查提醒"}]}}),
+    json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "t1", "name": "mcp__clawbot__remind__list", "input": {"args": ""}}]}}),
+    json.dumps({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "筆記本是空的"}]}}),
+    "this is not json",
+    json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "目前沒有提醒。"}]}}),
+    json.dumps(make_payload(type="result", result="目前沒有提醒。", session_id="s-1", num_turns=2)),
+]
+
+
+class TestAskStream(BaseCase):
+
+    def _run(self, lines=STREAM, returncode=0, stderr="", block=False, **kwargs):
+        events = []
+        FakePopen.instances = []
+        factory = lambda cmd, **kw: FakePopen(cmd, lines, returncode, stderr, block, **kw)  # noqa: E731
+        with mock.patch.object(cs.subprocess, "Popen", side_effect=factory):
+            result = cs.ask_stream("hi", events.append, **kwargs)
+        return result, events, FakePopen.instances[-1]
+
+    def test_events_in_order_and_same_result_as_ask(self):
+        result, events, proc = self._run()
+        self.assertEqual([e["type"] for e in events], ["system", "assistant", "assistant", "user", "assistant", "result"])
+        self.assertEqual(result.text, "目前沒有提醒。")
+        self.assertEqual(result.session_id, "s-1")
+        self.assertEqual(result.num_turns, 2)
+        self.assertAlmostEqual(result.cost_usd, 0.00123)
+        self.assertEqual(proc.stdin.getvalue(), "hi")
+
+    def test_argv_uses_stream_json_and_verbose(self):
+        _r, _e, proc = self._run(model="sonnet", resume="s-0")
+        cmd = proc.cmd
+        self.assertEqual(cmd[cmd.index("--output-format") + 1], "stream-json")
+        self.assertIn("--verbose", cmd)
+        self.assertNotIn("--include-partial-messages", cmd)
+        self.assertEqual(cmd[cmd.index("--resume") + 1], "s-0")
+        _r, _e, proc = self._run(include_partial=True)
+        self.assertIn("--include-partial-messages", proc.cmd)
+
+    def test_callback_error_does_not_break_the_call(self):
+        FakePopen.instances = []
+
+        def boom(event):
+            raise RuntimeError("display broke")
+
+        factory = lambda cmd, **kw: FakePopen(cmd, STREAM, **kw)  # noqa: E731
+        with mock.patch.object(cs.subprocess, "Popen", side_effect=factory), redirect_stderr(io.StringIO()):
+            result = cs.ask_stream("hi", boom)
+        self.assertEqual(result.text, "目前沒有提醒。")
+
+    def test_auth_failure_without_result(self):
+        with self.assertRaises(cs.ClaudeAuthError):
+            self._run(lines=[], returncode=1, stderr="Error: Please log in again")
+
+    def test_error_result_raises(self):
+        bad = json.dumps(make_payload(type="result", subtype="error_max_budget_usd", is_error=True))
+        with self.assertRaises(cs.ClaudeError):
+            self._run(lines=[bad])
+
+    def test_missing_result_event(self):
+        with self.assertRaises(cs.ClaudeError):
+            self._run(lines=[STREAM[0]])
+
+    def test_timeout_kills_the_process(self):
+        with self.assertRaises(cs.ClaudeError) as ctx:
+            self._run(lines=[STREAM[0]], block=True, timeout=0.2)
+        self.assertIn("逾時", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
