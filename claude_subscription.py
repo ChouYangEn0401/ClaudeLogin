@@ -69,7 +69,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "ask",
@@ -79,6 +79,7 @@ __all__ = [
     "ClaudeResult",
     "ClaudeError",
     "ClaudeAuthError",
+    "ClaudeUsageLimitError",
     "ClaudeNotFoundError",
     "EXIT_OK",
     "EXIT_CALL_FAILED",
@@ -272,6 +273,17 @@ class ClaudeAuthError(ClaudeError):
     """認證失敗：沒登入、token 過期、API key 無效。對應結束碼 3。"""
 
 
+class ClaudeUsageLimitError(ClaudeError):
+    """訂閱的使用額度用完了（HTTP 429、「You've hit your session limit」這類）。結束碼 1。
+
+    ``resets``：Claude 說的重置時間原文（例如 ``"7pm (Asia/Taipei)"``），抓不到就是空字串。
+    ``str(e)`` 是給人看的一句話，不含 claude 的原始輸出——呼叫端可以直接顯示。"""
+
+    def __init__(self, message: str, resets: str = ""):
+        super().__init__(message)
+        self.resets = resets
+
+
 class ClaudeNotFoundError(FileNotFoundError):
     """找不到 claude 執行檔。對應結束碼 2。
 
@@ -313,6 +325,23 @@ _AUTH_ERROR_MARKERS = (
     "expired credentials",
     "run `claude login`",
 )
+
+
+# 額度用完的措辭（Claude Code 的訂閱上限、API 的 rate limit）。一樣是啟發式；HTTP 429 不看字也算。
+_LIMIT_RE = re.compile(r"(?i)(hit your (?:\w+ )?limit|usage limit|limit (?:reached|exceeded)|rate.?limit|"
+                       r"out of (?:extra )?usage|too many requests)")
+_RESETS_RE = re.compile(r"(?i)resets?\s*(?:at\s*)?([^·\n.;]{1,40})")
+
+
+def _usage_limit(text: str, status=None):
+    """是額度用完就回 ClaudeUsageLimitError，不是回 None。"""
+    text = " ".join(str(text or "").split())
+    if status != 429 and not _LIMIT_RE.search(text):
+        return None
+    match = _RESETS_RE.search(text)
+    resets = match.group(1).strip() if match else ""
+    shown = text[:200] if text else "HTTP 429"
+    return ClaudeUsageLimitError(f"Claude 的使用額度用完了：{shown}", resets=resets)
 
 
 def _looks_like_auth_failure(*texts: str) -> bool:
@@ -611,15 +640,23 @@ def _raise_process_failure(returncode: int, stderr: str, stdout: str):
     detail = f"claude 子程序失敗 (exit {returncode}).\nstderr:\n{(stderr or '').strip()}"
     if _looks_like_auth_failure(stderr, stdout):
         raise ClaudeAuthError(detail)
+    limit = _usage_limit(f"{stderr or ''} {(stdout or '')[-2000:]}")
+    if limit is not None:
+        raise limit
     raise ClaudeError(detail)
 
 
 def _result_from(payload: dict, stdout: str, stderr: str) -> ClaudeResult:
     """claude 的 result JSON（json 模式整包、stream-json 模式最後一個事件）→ ClaudeResult，或丟出對應的例外。"""
     if payload.get("is_error") or payload.get("subtype") != "success":
+        said = str(payload.get("result") or "").strip()
+        limit = _usage_limit(said, payload.get("api_error_status"))
+        if limit is not None:
+            raise limit
+        # 要看的是 claude 最後說了什麼（result）；stream-json 的開頭是 init 事件（一長串工具清單），沒用
         detail = (
             f"Claude 回報錯誤：subtype={payload.get('subtype')}, "
-            f"api_error_status={payload.get('api_error_status')}\n{stdout[:1000]}"
+            f"api_error_status={payload.get('api_error_status')}\n{said[:1000] or stdout[-1000:]}"
         )
         # 401/403 是明確的認證失敗；其餘再用關鍵字啟發式判斷。
         if payload.get("api_error_status") in (401, 403) or _looks_like_auth_failure(

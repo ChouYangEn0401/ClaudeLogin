@@ -288,6 +288,35 @@ class TestFailureClassification(BaseCase):
         self.assertFalse(cs._looks_like_auth_failure("rate limit exceeded"))
         self.assertFalse(cs._looks_like_auth_failure(""))
 
+    def test_http_429_becomes_usage_limit_with_reset_time(self):
+        """2026-10-03 實測：額度用完時 claude 回 is_error + 429，訊息在 result；以前印出一長串 init 事件。"""
+        with mock.patch.object(cs.subprocess, "run") as run:
+            run.return_value = completed(json.dumps(make_payload(
+                is_error=True, subtype="success", api_error_status=429,
+                result="You've hit your session limit · resets 7pm (Asia/Taipei)")))
+            with self.assertRaises(cs.ClaudeUsageLimitError) as ctx:
+                cs.ask("hi")
+        self.assertEqual(ctx.exception.resets, "7pm (Asia/Taipei)")
+        self.assertIn("session limit", str(ctx.exception))
+        self.assertNotIn("init", str(ctx.exception))
+        self.assertTrue(issubclass(cs.ClaudeUsageLimitError, cs.ClaudeError))
+
+    def test_limit_wording_without_status_and_on_stderr(self):
+        self.assertIsNotNone(cs._usage_limit("Claude usage limit reached. Your limit will reset at 5am."))
+        self.assertIsNone(cs._usage_limit("model overloaded"))
+        with mock.patch.object(cs.subprocess, "run") as run:
+            run.return_value = completed(stderr="Error: You've hit your weekly limit", returncode=1)
+            with self.assertRaises(cs.ClaudeUsageLimitError):
+                cs.ask("hi")
+
+    def test_other_errors_show_the_result_not_the_init_event(self):
+        with mock.patch.object(cs.subprocess, "run") as run:
+            run.return_value = completed(json.dumps(make_payload(is_error=True, subtype="error_during_execution",
+                                                                 result="tool crashed")))
+            with self.assertRaises(cs.ClaudeError) as ctx:
+                cs.ask("hi")
+        self.assertIn("tool crashed", str(ctx.exception))
+
     def test_not_found_error_is_still_a_file_not_found_error(self):
         """向後相容：舊程式碼可能寫 except FileNotFoundError。"""
         self.assertTrue(issubclass(cs.ClaudeNotFoundError, FileNotFoundError))
