@@ -299,6 +299,33 @@ timeout, binary, auth, attach, resume, session_id, persist, cwd, extra_args) -> 
 | `ClaudeError` | 其他呼叫失敗 | 1 |
 | `FileNotFoundError` / `ValueError` | 附檔不存在、附檔非文字、參數不合法 | 4 |
 
+### `ask_stream()`：邊跑邊看到事件（v0.3.0）
+
+參數、回傳值、例外都跟 `ask()` 一樣，只多一個 `on_event(event: dict)`。底下用
+`--output-format stream-json --verbose`，claude 每做一步就吐一行 JSON，先交給 `on_event`，
+最後一樣回傳 `ClaudeResult`。適合做「AI 現在在想／在呼叫哪個工具／工具回了什麼」的即時進度顯示。
+
+```python
+from claude_subscription import ask_stream
+
+def show(event):
+    if event["type"] == "assistant":
+        for block in event["message"]["content"]:
+            print(block["type"], block.get("name") or block.get("text", "")[:40])
+
+result = ask_stream("幫我看今天的提醒", show, tools="Read", resume=last_session_id)
+```
+
+| 事件 `type` | 內容 |
+|-------------|------|
+| `system`（`subtype: init`） | session id、可用的工具 |
+| `assistant` | `message.content` 裡的 `thinking`、`text`、`tool_use`（`name`、`input`） |
+| `user` | `message.content` 裡的 `tool_result`（工具回了什麼） |
+| `result` | 最後一個；欄位跟 `ask()` 的 JSON 一樣（`result`、`total_cost_usd`、`modelUsage`、`session_id`…） |
+| `stream_event` | 只有 `include_partial=True` 才有：逐字的片段 |
+
+`on_event` 丟出的例外不會中斷這次呼叫（只印到 stderr）——顯示壞掉不該讓 AI 這一輪失敗。
+
 ---
 
 ## 用法二：命令列（任何語言都能 shell out 呼叫）
