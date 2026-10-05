@@ -101,7 +101,7 @@ python claude_subscription.py --format json "分類情緒：這服務爛透了"
 
 **③ 想要「一個指令」→ `pip install` 或用啟動器**
 ```bash
-pip install claude_subscription-0.2.0-py3-none-any.whl
+pip install claude_subscription-0.2.1-py3-none-any.whl
 claude-sub "你的提示"
 ```
 
@@ -190,7 +190,7 @@ claude-sub --check --no-ping    # 只做靜態檢查，完全不花錢（適合 
 
 **第 4 步：讓它「隨處可用」（三選一）**
 
-1. **pip 安裝（最推薦）**：`pip install claude_subscription-0.2.0-py3-none-any.whl`，
+1. **pip 安裝（最推薦）**：`pip install claude_subscription-0.2.1-py3-none-any.whl`，
    得到全域指令 `claude-sub`。跨平台指令名一致，不用改 PATH。
 2. **啟動器腳本**：把本資料夾加入系統 PATH。**注意 wheel 裡不含這兩個檔**，
    要用得從原始碼資料夾拿：
@@ -463,7 +463,7 @@ agent 參數透傳與 `check_setup` 的所有分支。用標準庫 `unittest`，
 python -m venv .venv
 ./.venv/Scripts/python -m pip install build      # macOS/Linux: ./.venv/bin/python
 ./.venv/Scripts/python -m build --wheel
-# -> dist/claude_subscription-0.2.0-py3-none-any.whl
+# -> dist/claude_subscription-0.2.1-py3-none-any.whl
 ```
 
 產出的 wheel 是 `py3-none-any`（純 Python、跨平台通用），**零相依**，內容只有
