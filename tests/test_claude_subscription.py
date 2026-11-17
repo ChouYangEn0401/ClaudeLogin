@@ -141,6 +141,24 @@ class TestCommandConstruction(BaseCase):
             cs.ask("hi")
         self.assertEqual(run.call_args.kwargs["errors"], "replace")
 
+    def _run_kwargs_on(self, platform_name: str) -> dict:
+        with mock.patch.object(cs.sys, "platform", platform_name):
+            with mock.patch.object(cs.subprocess, "run") as run:
+                run.return_value = completed(json.dumps(make_payload()))
+                cs.ask("hi")
+        return run.call_args.kwargs
+
+    def test_windows_hides_console_window(self):
+        """Windows 上從 GUI 程式呼叫時，不能每次都閃出 claude.exe 的主控台黑窗。"""
+        kwargs = self._run_kwargs_on("win32")
+        self.assertEqual(kwargs["creationflags"], 0x08000000)  # CREATE_NO_WINDOW
+
+    def test_other_platforms_get_no_creationflags(self):
+        """creationflags 是 Windows 專屬參數，其他平台傳了會 ValueError。"""
+        for name in ("linux", "darwin"):
+            with self.subTest(platform=name):
+                self.assertNotIn("creationflags", self._run_kwargs_on(name))
+
 
 class TestSessionHandling(BaseCase):
     def _cmd(self, **kwargs) -> list:
@@ -789,6 +807,17 @@ class TestAskStream(BaseCase):
         self.assertEqual(cmd[cmd.index("--resume") + 1], "s-0")
         _r, _e, proc = self._run(include_partial=True)
         self.assertIn("--include-partial-messages", proc.cmd)
+
+    def test_stream_windows_hides_console_window_other_platforms_do_not(self):
+        """ask_stream 也走 Popen，同樣不能閃主控台視窗；非 Windows 不能傳 creationflags。"""
+        for name, expect in (("win32", 0x08000000), ("linux", None), ("darwin", None)):
+            with self.subTest(platform=name):
+                with mock.patch.object(cs.sys, "platform", name):
+                    _r, _e, proc = self._run()
+                if expect is None:
+                    self.assertNotIn("creationflags", proc.kwargs)
+                else:
+                    self.assertEqual(proc.kwargs["creationflags"], expect)
 
     def test_callback_error_does_not_break_the_call(self):
         FakePopen.instances = []
