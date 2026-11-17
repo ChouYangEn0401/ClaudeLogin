@@ -69,7 +69,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 __all__ = [
     "ask",
@@ -454,6 +454,7 @@ def ask(
             env=env,
             cwd=cwd,
             timeout=timeout,
+            **_no_window_kwargs(),
         )
     except subprocess.TimeoutExpired as e:
         raise ClaudeError(f"呼叫逾時（{timeout}s）。") from e
@@ -519,6 +520,7 @@ def ask_stream(
             errors="replace",
             env=env,
             cwd=cwd,
+            **_no_window_kwargs(),
         )
     except OSError as e:
         raise ClaudeNotFoundError(f"無法執行 {claude}：{e}\n\n{_install_hint()}") from e
@@ -634,6 +636,17 @@ def _prepare(prompt: str, output_format: str, *, model, system, json_schema, max
         # 不動 base URL 類變數：走自架 proxy / Bedrock / Vertex 是合理用法。
     # auth == "auto"：完全不更動，照 Claude Code 既有的憑證優先順序。
     return claude, cmd, env, prompt
+
+
+def _no_window_kwargs() -> dict:
+    """Windows：claude.exe 是主控台程式。呼叫端如果本身沒有主控台（例如 PyInstaller
+    --windowed 打包的 GUI、pythonw），系統會替子程序開一個新的主控台視窗，
+    每呼叫一次就閃一下黑窗。CREATE_NO_WINDOW 讓它不開視窗；stdin/stdout/stderr
+    都已經用 pipe 接走，不影響結果。其他平台沒有這個問題，也不能傳（會 ValueError）。
+    ask() 與 ask_stream() 都要帶。"""
+    if sys.platform == "win32":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {}
 
 
 def _raise_process_failure(returncode: int, stderr: str, stdout: str):

@@ -5,6 +5,11 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-17
+
+### Fixed
+- Windows 上從沒有主控台的 GUI 程式（pythonw、PyInstaller --windowed）呼叫時，每次都會閃出 claude 的主控台視窗：ask() 與 ask_stream() 在 Windows 改用 `CREATE_NO_WINDOW` 啟動子程序（原 0.2.1 的修正，合併進 0.3.x 線；ask_stream 是新增的呼叫點，一併處理）。
+
 ## [0.3.1] - 2026-11-12
 
 ### Added
