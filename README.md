@@ -101,7 +101,7 @@ python claude_subscription.py --format json "分類情緒：這服務爛透了"
 
 **③ 想要「一個指令」→ `pip install` 或用啟動器**
 ```bash
-pip install claude_subscription-0.3.2-py3-none-any.whl
+pip install claude_subscription-0.4.0-py3-none-any.whl
 claude-sub "你的提示"
 ```
 
@@ -190,7 +190,7 @@ claude-sub --check --no-ping    # 只做靜態檢查，完全不花錢（適合 
 
 **第 4 步：讓它「隨處可用」（三選一）**
 
-1. **pip 安裝（最推薦）**：`pip install claude_subscription-0.3.2-py3-none-any.whl`，
+1. **pip 安裝（最推薦）**：`pip install claude_subscription-0.4.0-py3-none-any.whl`，
    得到全域指令 `claude-sub`。跨平台指令名一致，不用改 PATH。
 2. **啟動器腳本**：把本資料夾加入系統 PATH。**注意 wheel 裡不含這兩個檔**，
    要用得從原始碼資料夾拿：
@@ -258,7 +258,7 @@ r = ask(
 ### `ask()` 完整 API
 
 簽名：`ask(prompt, *, model, system, json_schema, max_budget_usd, tools, permission_mode,
-timeout, binary, auth, attach, resume, session_id, persist, cwd, extra_args) -> ClaudeResult`
+timeout, binary, auth, attach, resume, session_id, persist, cwd, extra_args, isolated) -> ClaudeResult`
 
 | 參數 | 預設 | 說明 |
 |------|------|------|
@@ -278,6 +278,7 @@ timeout, binary, auth, attach, resume, session_id, persist, cwd, extra_args) -> 
 | `persist` | `False` | 保留 session 到磁碟（要日後 resume 就設 True） |
 | `cwd` | `None` | claude 的工作目錄。**開工具時務必指定** |
 | `extra_args` | `None` | 額外傳給 claude 的參數 list |
+| `isolated` | `False` | 隔離模式（見下方「🔒 隔離模式」）。預設 `False`＝行為跟以前完全一樣 |
 
 回傳 `ClaudeResult`：
 
@@ -296,6 +297,7 @@ timeout, binary, auth, attach, resume, session_id, persist, cwd, extra_args) -> 
 |------|------|------|
 | `ClaudeNotFoundError`（繼承 `FileNotFoundError`） | 找不到 claude 執行檔 | 2 |
 | `ClaudeAuthError`（繼承 `ClaudeError`） | 沒登入 / token 過期 / API key 無效 | 3 |
+| `ClaudeIsolationUnsupportedError`（繼承 `ClaudeError`） | 隔離模式需要的旗標，這版 claude 沒有（`.missing` 列出缺哪些） | 1 |
 | `ClaudeError` | 其他呼叫失敗 | 1 |
 | `FileNotFoundError` / `ValueError` | 附檔不存在、附檔非文字、參數不合法 | 4 |
 
@@ -325,6 +327,65 @@ result = ask_stream("幫我看今天的提醒", show, tools="Read", resume=last_
 | `stream_event` | 只有 `include_partial=True` 才有：逐字的片段 |
 
 `on_event` 丟出的例外不會中斷這次呼叫（只印到 stderr）——顯示壞掉不該讓 AI 這一輪失敗。
+
+### 🔒 隔離模式：`isolated=True` 與 `search()`（v0.4.0）
+
+給「別的程式要叫一個乾淨、只能上網搜尋的 Claude Code」用。一般模式會沿用這台電腦的
+Claude Code 設定（你的 CLAUDE.md、記憶、MCP、hooks……）；隔離模式把這些全部關掉。
+
+```python
+from claude_subscription import search
+
+r = search("最新的 Python 版本是哪一版？")          # isolated=True 是預設
+print(r["text"])                                     # 答案
+for s in r["sources"]:                               # [{"title": ..., "url": ...}, ...]
+    print(s["title"], s["url"])
+```
+
+`search(query, *, isolated=True, model="haiku", system=<內建搜尋提示>, max_budget_usd=None,
+timeout=180, binary=None, auth="subscription", on_event=None) -> {"text": str, "sources": list}`
+
+- `sources` 只收「答案有引用、**而且真的出現在 WebSearch 結果裡**」的網址（擋掉模型自己編的網址）；
+  答案沒引用任何網址時，給全部搜尋結果；讀不到搜尋結果的格式時，退而用答案裡的網址。
+- `on_event` 可以拿來顯示進度（跟 `ask_stream` 一樣）。
+- `isolated=False`：一樣只開 WebSearch、`dontAsk`，但會沿用這台電腦的 Claude Code 設定。
+
+也可以直接用底層：`ask(..., isolated=True)`、`ask_stream(..., isolated=True)`、
+CLI `claude-sub --isolated [--tools WebSearch] "……"`。
+
+**隔離模式保證的事**
+
+| 項目 | 怎麼做到 |
+|------|---------|
+| 不讀使用者／專案設定、CLAUDE.md | `--setting-sources ""`＋`--safe-mode`（連帶不跑設定裡的 hooks） |
+| 不讀自動記憶 | 環境變數 `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`＋`--safe-mode` |
+| 不載入任何 MCP、skills | `--strict-mcp-config`（不給 `--mcp-config`＝零個）、`ENABLE_CLAUDEAI_MCP_SERVERS=false`、`--disable-slash-commands`、`--no-chrome` |
+| 工具只有 WebSearch（或全關） | `--tools` 只接受 `""` 或 `WebSearch`；`--allowedTools WebSearch`、`--disallowedTools WebFetch`、`--restricted` |
+| 不會跳出／自動同意其他權限 | `--permission-mode dontAsk`（沒事先允許的工具一律拒絕） |
+| 工作目錄是空的、用完刪掉 | 每次新開一個暫存資料夾（`work/` 當工作目錄、`tmp/` 給 TEMP），結束後整個刪掉，失敗也刪 |
+| 不留對話紀錄 | `--no-session-persistence` |
+| 子程序只拿到必要的環境變數 | 白名單：系統必要（PATH、家目錄、Windows 系統變數、語系）、proxy／憑證設定，加上**這種登入方式需要的那一個**憑證（訂閱：`CLAUDE_CODE_OAUTH_TOKEN`；apikey：`ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`）。其他金鑰一律不傳 |
+| 不把查詢寫進日誌 | 查詢走 stdin（不在命令列、不在環境變數）；本工具不寫任何日誌；隔離模式的錯誤訊息不附 claude 的原始輸出；另外設 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 關掉遙測與錯誤回報 |
+
+**版本不支援就報錯，不放寬**：每次隔離呼叫前，會先讀 `claude --help`（只讀說明，不送請求；
+同一個執行檔只讀一次），確認這次要用的**每一個**旗標都存在。缺任何一個就丟
+`ClaudeIsolationUnsupportedError`（`.missing` 列出缺哪些；CLI 結束碼 1），請先 `claude update`。
+
+**不能一起用**（丟 `ValueError`，CLI 結束碼 4）：`cwd`、`resume`、`session_id`、`persist`、
+`extra_args`（CLI 的 `--cwd`、`--resume`、`--session`、`--continue`、`--persist`、`--claude-arg`），
+`tools` 不是 `""`／`WebSearch`，`permission_mode` 不是 `dontAsk`，以及 `auth="auto"`
+（隔離模式要確定只傳哪一個憑證，所以只支援 `subscription`、`apikey`）。
+
+**限制（請知道）**
+
+- **不是沙箱**：claude 仍以你的使用者身分執行，讀得到家目錄（登入憑證在那裡，訂閱登入一定要）。
+  隔離靠的是 Claude Code 自己的旗標「不去讀」設定與記憶，不是作業系統層級的隔離。
+- 「不留紀錄」指的是不保存 session。Claude Code 可能仍會在自己的設定資料夾留下這個暫存工作目錄的專案項目
+  （不含對話內容），可用 `claude purge <路徑>` 清掉；這部分要真機確認。
+- 網路搜尋本身會把查詢送到 Anthropic 與搜尋服務，這是搜尋的必要代價。
+- `auth="apikey"` 只傳 `ANTHROPIC_API_KEY`／`ANTHROPIC_BASE_URL`；Bedrock／Vertex／Foundry 需要的雲端憑證不會傳，隔離模式不支援這些供應商。
+- 公司網路要走 proxy 的話，`HTTPS_PROXY` 等變數會照傳（連網必要）；proxy 網址裡若含帳密，也會一起傳給子程序。
+- 隔離模式用到的旗標（`--safe-mode`、`--restricted` 等）是 Claude Code 較新版才有的；舊版會直接報錯。
 
 ---
 
@@ -384,6 +445,7 @@ claude-sub --version
 | `--tools` | 預設 `""`(全關)；`default`(全開)；或 `Read,Bash` |
 | `--permission-mode` | `acceptEdits` / `auto` / `bypassPermissions` / `manual` / `dontAsk` / `plan`。**不設的話寫檔會被擋** |
 | `--cwd DIR` | claude 的工作目錄。開工具時務必指定 |
+| `--isolated` | 隔離模式（見「🔒 隔離模式」）。`--tools` 只能 `""` 或 `WebSearch`；不能和 `--cwd`、session 旗標、`--claude-arg` 合用 |
 | `--claude-arg ARG` | 直接透傳一個參數給官方 claude（可重複） |
 | **session** | |
 | `--resume SESSION_ID` | 延續指定對話 |
@@ -458,9 +520,10 @@ console.log(r2.text);       // -> A-12345
 python -m unittest discover -s tests -v
 ```
 
-85 個測試，涵蓋命令列組裝、auth 環境變數清理、失敗分類、結束碼契約、輸出格式、
-agent 參數透傳與 `check_setup` 的所有分支。用標準庫 `unittest`，不需要裝 pytest
-（維持零相依）。
+144 個測試，涵蓋命令列組裝、auth 環境變數清理、失敗分類、結束碼契約、輸出格式、
+agent 參數透傳、`check_setup` 的所有分支，以及隔離模式與 `search()`
+（`tests/test_isolated.py`：用假子程序與假的 `claude --help` 驗證每一條隔離承諾）。
+用標準庫 `unittest`，不需要裝 pytest（維持零相依）。
 
 ---
 
@@ -490,7 +553,7 @@ agent 參數透傳與 `check_setup` 的所有分支。用標準庫 `unittest`，
 python -m venv .venv
 ./.venv/Scripts/python -m pip install build      # macOS/Linux: ./.venv/bin/python
 ./.venv/Scripts/python -m build --wheel
-# -> dist/claude_subscription-0.3.2-py3-none-any.whl
+# -> dist/claude_subscription-0.4.0-py3-none-any.whl
 ```
 
 產出的 wheel 是 `py3-none-any`（純 Python、跨平台通用），**零相依**，內容只有
@@ -503,6 +566,7 @@ python -m venv .venv
 
 - `claude_subscription.py` — 核心函式庫 + 命令列工具（**發佈必備，且零相依套件**）。
 - `tests/test_claude_subscription.py` — 離線測試套件（不花錢、不需網路）。
+- `tests/test_isolated.py` — 隔離模式與 `search()` 的離線測試（假子程序、假 `claude --help`）。
 - `claude-ask.bat` — Windows 啟動器（加入 PATH 後可在任何位置用 `claude-ask`）。
 - `claude-ask.sh` — macOS / Linux 啟動器。
 - `example_usage.py` — Python import 範例（重點整理 / 結構化 JSON / 批次分類 / session 延續 / agent 寫檔）。

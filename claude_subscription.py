@@ -51,35 +51,43 @@ claude_subscription.py
 1. Python 程式內：``from claude_subscription import ask``
 2. 任何語言（shell out）：``python claude_subscription.py --model haiku "你的提示"``
 3. 新電腦先自我診斷：``python claude_subscription.py --check``
+4. 乾淨、只能上網搜尋的搜尋員：``from claude_subscription import search``；
+   ``search(query)`` 回傳 ``{"text", "sources"}``（隔離模式，見 ask() 的 ``isolated``）。
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import json
 import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 __all__ = [
     "ask",
     "ask_stream",
+    "search",
     "check_setup",
     "find_claude_binary",
     "ClaudeResult",
     "ClaudeError",
     "ClaudeAuthError",
     "ClaudeUsageLimitError",
+    "ClaudeIsolationUnsupportedError",
     "ClaudeNotFoundError",
     "EXIT_OK",
     "EXIT_CALL_FAILED",
@@ -284,6 +292,17 @@ class ClaudeUsageLimitError(ClaudeError):
         self.resets = resets
 
 
+class ClaudeIsolationUnsupportedError(ClaudeError):
+    """``isolated=True``，但這台電腦的 claude 不支援隔離需要的旗標（或無法確認）。結束碼 1。
+
+    隔離模式寧可不跑也不放寬：只要有一個旗標查不到，就丟這個例外，不會少帶幾個旗標照跑。
+    ``missing``：``claude --help`` 裡找不到的旗標清單（無法讀取說明時是空的）。"""
+
+    def __init__(self, message: str, missing: Optional[list] = None):
+        super().__init__(message)
+        self.missing = list(missing or [])
+
+
 class ClaudeNotFoundError(FileNotFoundError):
     """找不到 claude 執行檔。對應結束碼 2。
 
@@ -307,6 +326,38 @@ _PROVIDER_ENV_VARS = (
     "ANTHROPIC_VERTEX_BASE_URL",
     "ANTHROPIC_CUSTOM_HEADERS",
 )
+
+# --------------------------------------------------------------------------- #
+# 隔離模式（isolated=True）
+# --------------------------------------------------------------------------- #
+# 隔離模式能開的工具：什麼都不開，或只開 WebSearch。WebFetch 與其他工具一律不准。
+_ISOLATED_TOOLS = ("", "WebSearch")
+
+# 子程序環境只留這些（比對時不分大小寫）。其餘一律不傳——尤其是別的金鑰、token。
+# 系統必要：找得到家目錄（登入憑證在那裡）、Windows 能正常啟動程式、語系、連網用的 proxy／憑證。
+_ISOLATED_ENV_KEEP = frozenset(
+    name.upper()
+    for name in (
+        "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC",
+        "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+        "USER", "LOGNAME", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE",
+        "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY",
+        "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    )
+)
+# 依登入方式額外放行的憑證變數（只放這一種登入需要的）。
+_ISOLATED_AUTH_ENV = {
+    "subscription": ("CLAUDE_CODE_OAUTH_TOKEN",),
+    "apikey": ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
+}
+# 隔離模式固定加上的環境變數：關掉自動記憶、claude.ai 上的 MCP 連接器、遙測與錯誤回報。
+_ISOLATED_ENV_SET = {
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+    "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+}
+# claude --help 的結果，依（路徑, 修改時間, 大小）快取：換版本就會重查。
+_HELP_CACHE: dict = {}
 
 # 判斷失敗是不是「認證問題」的關鍵字（用來把結束碼從 1 升級成 3）。
 # 這是啟發式判斷：claude 的錯誤訊息措辭可能改變，判斷不到時仍會回 1（呼叫失敗），
@@ -393,6 +444,7 @@ def ask(
     persist: bool = False,
     cwd: Optional[str] = None,
     extra_args: Optional[list[str]] = None,
+    isolated: bool = False,
 ) -> ClaudeResult:
     """送一個提示給 Claude（透過官方 claude CLI），回傳 ClaudeResult。
 
@@ -426,6 +478,14 @@ def ask(
                     **開啟工具時務必指定**，否則 Claude 會在呼叫你程式的那個
                     資料夾裡讀寫檔案。
     extra_args    : 額外要傳給 claude 的參數（list of str）。
+    isolated      : True＝隔離模式（預設 False，行為跟以前一樣）。乾淨的 Claude Code：
+                    不讀使用者／專案設定、CLAUDE.md、自動記憶，不載入 MCP、skills、hooks；
+                    工具只能是 ""（全關）或 "WebSearch"，權限模式固定 dontAsk；
+                    在新開的空暫存資料夾裡跑、跑完刪掉；不保存 session；
+                    子程序只拿到必要的環境變數（不帶其他金鑰）。
+                    不能跟 cwd / resume / session_id / persist / extra_args 一起用，
+                    auth 只能是 subscription 或 apikey。這版 claude 不支援需要的旗標時
+                    丟 ClaudeIsolationUnsupportedError，絕不放寬照跑。
 
     回傳的 ClaudeResult.session_id 可用於下一次 resume，達成多輪對話延續。
 
@@ -433,16 +493,22 @@ def ask(
     ----
     ClaudeNotFoundError : 找不到 claude 執行檔（結束碼 2）。
     ClaudeAuthError     : 沒登入 / token 過期 / API key 無效（結束碼 3）。
+    ClaudeIsolationUnsupportedError : 隔離模式需要的旗標這版 claude 沒有（結束碼 1）。
     ClaudeError         : 其他呼叫失敗（結束碼 1）。
     FileNotFoundError   : 附檔不存在（結束碼 4）。
-    ValueError          : auth 模式不合法、或附檔不是文字檔（結束碼 4）。
+    ValueError          : auth 模式不合法、附檔不是文字檔、隔離模式參數衝突（結束碼 4）。
     """
-    claude, cmd, env, prompt = _prepare(
-        prompt, "json", model=model, system=system, json_schema=json_schema,
-        max_budget_usd=max_budget_usd, tools=tools, permission_mode=permission_mode, binary=binary,
-        auth=auth, attach=attach, resume=resume, session_id=session_id, persist=persist,
-        extra_args=extra_args)
+    with _workspace(isolated) as tmp_root:
+        claude, cmd, env, prompt, run_cwd = _prepare(
+            prompt, "json", model=model, system=system, json_schema=json_schema,
+            max_budget_usd=max_budget_usd, tools=tools, permission_mode=permission_mode, binary=binary,
+            auth=auth, attach=attach, resume=resume, session_id=session_id, persist=persist,
+            cwd=cwd, extra_args=extra_args, isolated=isolated, tmp_root=tmp_root)
+        return _run_json(claude, cmd, env, prompt, run_cwd, timeout, redact=isolated)
 
+
+def _run_json(claude, cmd, env, prompt, cwd, timeout, *, redact: bool) -> ClaudeResult:
+    """ask() 的子程序部分：一次跑完、讀整包 JSON。redact=True 時錯誤訊息不附 claude 的原始輸出。"""
     try:
         proc = subprocess.run(
             cmd,
@@ -467,8 +533,9 @@ def ask(
     try:
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError as e:
-        raise ClaudeError(f"無法解析 claude 的 JSON 輸出。\nstdout:\n{proc.stdout[:2000]}") from e
-    return _result_from(payload, proc.stdout, proc.stderr)
+        shown = "（隔離模式不附原始輸出）" if redact else f"\nstdout:\n{proc.stdout[:2000]}"
+        raise ClaudeError(f"無法解析 claude 的 JSON 輸出。{shown}") from e
+    return _result_from(payload, proc.stdout, proc.stderr, redact=redact)
 
 
 def ask_stream(
@@ -491,6 +558,7 @@ def ask_stream(
     persist: bool = False,
     cwd: Optional[str] = None,
     extra_args: Optional[list[str]] = None,
+    isolated: bool = False,
 ) -> ClaudeResult:
     """跟 ask() 一樣（參數、例外、回傳值都相同），但過程中的每一個事件都先交給 on_event。
 
@@ -502,13 +570,21 @@ def ask_stream(
 
     on_event 在讀 stdout 的同一條執行緒上被呼叫；它丟出的例外不會中斷這次呼叫（只寫到 stderr）。
     適合拿來做「AI 現在在想／在呼叫哪個工具」的即時進度顯示。
+    isolated=True 的意思與限制跟 ask() 相同。
     """
-    claude, cmd, env, prompt = _prepare(
-        prompt, "stream-json", model=model, system=system, json_schema=json_schema,
-        max_budget_usd=max_budget_usd, tools=tools, permission_mode=permission_mode, binary=binary,
-        auth=auth, attach=attach, resume=resume, session_id=session_id, persist=persist,
-        extra_args=(["--verbose"] + (["--include-partial-messages"] if include_partial else [])
-                    + list(extra_args or [])))
+    stream_args = ["--verbose"] + (["--include-partial-messages"] if include_partial else [])
+    with _workspace(isolated) as tmp_root:
+        claude, cmd, env, prompt, run_cwd = _prepare(
+            prompt, "stream-json", model=model, system=system, json_schema=json_schema,
+            max_budget_usd=max_budget_usd, tools=tools, permission_mode=permission_mode, binary=binary,
+            auth=auth, attach=attach, resume=resume, session_id=session_id, persist=persist,
+            cwd=cwd, extra_args=extra_args, isolated=isolated, tmp_root=tmp_root,
+            stream_args=stream_args)
+        return _run_stream(claude, cmd, env, prompt, run_cwd, timeout, on_event, redact=isolated)
+
+
+def _run_stream(claude, cmd, env, prompt, cwd, timeout, on_event, *, redact: bool) -> ClaudeResult:
+    """ask_stream() 的子程序部分：一行一個事件交給 on_event，最後回傳 result 事件。"""
     try:
         proc = subprocess.Popen(
             cmd,
@@ -573,15 +649,23 @@ def ask_stream(
     if final is None:
         if proc.returncode != 0:
             _raise_process_failure(proc.returncode, stderr, stdout)
-        raise ClaudeError(f"claude 沒有送出 result 事件。\nstdout:\n{stdout[-2000:]}")
-    return _result_from(final, stdout, stderr)
+        shown = "（隔離模式不附原始輸出）" if redact else f"\nstdout:\n{stdout[-2000:]}"
+        raise ClaudeError(f"claude 沒有送出 result 事件。{shown}")
+    return _result_from(final, stdout, stderr, redact=redact)
 
 
 def _prepare(prompt: str, output_format: str, *, model, system, json_schema, max_budget_usd, tools,
-             permission_mode, binary, auth, attach, resume, session_id, persist, extra_args):
-    """ask() 與 ask_stream() 共用：組 argv、處理附檔、決定子程序的憑證環境。回傳 (claude, cmd, env, prompt)。"""
+             permission_mode, binary, auth, attach, resume, session_id, persist, extra_args,
+             cwd=None, isolated=False, tmp_root=None, stream_args=None):
+    """ask() 與 ask_stream() 共用：組 argv、處理附檔、決定子程序的憑證環境。
+
+    回傳 (claude, cmd, env, prompt, cwd)。isolated=True 時 cwd 是 tmp_root 底下新開的空資料夾。"""
     if auth not in ("subscription", "apikey", "auto"):
         raise ValueError(f"未知的 auth 模式：{auth!r}（可用：subscription / apikey / auto）")
+    if isolated:
+        tools, permission_mode = _check_isolated_args(
+            tools=tools, permission_mode=permission_mode, auth=auth, resume=resume,
+            session_id=session_id, persist=persist, cwd=cwd, extra_args=extra_args)
 
     claude = _resolve_binary(binary)
 
@@ -616,8 +700,17 @@ def _prepare(prompt: str, output_format: str, *, model, system, json_schema, max
         cmd += ["--max-budget-usd", str(max_budget_usd)]
     if permission_mode:
         cmd += ["--permission-mode", permission_mode]
+    if stream_args:
+        cmd += stream_args
     if extra_args:
         cmd += extra_args
+
+    if isolated:
+        cmd += _isolation_flags(tools)
+        work = os.path.join(tmp_root, "work")
+        env = _isolated_env(auth, os.path.join(tmp_root, "tmp"))
+        _require_isolation_support(claude, cmd, env, work)
+        return claude, cmd, env, prompt, work
 
     # 依 auth 模式決定子程序的憑證環境。
     env = os.environ.copy()
@@ -635,7 +728,239 @@ def _prepare(prompt: str, output_format: str, *, model, system, json_schema, max
             )
         # 不動 base URL 類變數：走自架 proxy / Bedrock / Vertex 是合理用法。
     # auth == "auto"：完全不更動，照 Claude Code 既有的憑證優先順序。
-    return claude, cmd, env, prompt
+    return claude, cmd, env, prompt, cwd
+
+
+# --------------------------------------------------------------------------- #
+# 3b. 隔離模式的零件
+# --------------------------------------------------------------------------- #
+def _check_isolated_args(*, tools, permission_mode, auth, resume, session_id, persist, cwd, extra_args):
+    """隔離模式不接受會削弱隔離的參數；回傳正規化後的 (tools, permission_mode)。不合就丟 ValueError。"""
+    tools = (tools or "").strip()
+    if tools not in _ISOLATED_TOOLS:
+        raise ValueError(f"隔離模式的 tools 只能是 \"\" 或 \"WebSearch\"，收到 {tools!r}。")
+    if permission_mode not in (None, "dontAsk"):
+        raise ValueError(f"隔離模式的權限模式固定是 dontAsk，不能設成 {permission_mode!r}。")
+    if auth not in _ISOLATED_AUTH_ENV:
+        raise ValueError(f"隔離模式的 auth 只能是 subscription 或 apikey，收到 {auth!r}。")
+    conflicts = [name for name, value in (
+        ("cwd", cwd), ("resume", resume), ("session_id", session_id), ("persist", persist),
+        ("extra_args", extra_args)) if value]
+    if conflicts:
+        raise ValueError(f"隔離模式不能同時指定：{', '.join(conflicts)}"
+                         "（工作目錄固定是新開的空暫存資料夾、不保存 session、不透傳旗標）。")
+    if auth == "apikey" and not os.environ.get("ANTHROPIC_API_KEY"):
+        raise ClaudeAuthError("auth='apikey' 但環境中沒有 ANTHROPIC_API_KEY。請先設定該環境變數。")
+    return tools, "dontAsk"
+
+
+def _isolation_flags(tools: str) -> list[str]:
+    """隔離模式固定加上的 claude 旗標（每一個都會先到 claude --help 確認有支援）。"""
+    flags = [
+        "--setting-sources", "",       # 不讀 user / project / local 設定檔（連帶不跑裡面的 hooks、MCP）
+        "--safe-mode",                  # 關掉 CLAUDE.md、skills、plugins、hooks、MCP 等所有自訂
+        "--restricted",                 # 拿掉會執行程式的工具與 WebFetch，檔案工具關在工作目錄
+        "--strict-mcp-config",          # 沒給 --mcp-config ＝ 一個 MCP 都不載入
+        "--disable-slash-commands",     # 不載入 skills / 自訂指令
+        "--no-chrome",                  # 不接瀏覽器整合
+        "--disallowedTools", "WebFetch",
+    ]
+    if tools == "WebSearch":
+        flags += ["--allowedTools", "WebSearch"]  # dontAsk 只放行預先允許的工具
+    return flags
+
+
+def _isolated_env(auth: str, tmp_dir: str) -> dict:
+    """隔離模式的子程序環境：白名單，只留系統必要的變數與這種登入需要的那一個憑證。"""
+    keep = _ISOLATED_ENV_KEEP | {name.upper() for name in _ISOLATED_AUTH_ENV[auth]}
+    env = {key: value for key, value in os.environ.items() if key.upper() in keep}
+    # 暫存檔也放進這次的暫存資料夾，跑完一起刪。
+    for name in ("TEMP", "TMP", "TMPDIR"):
+        env[name] = tmp_dir
+    env.update(_ISOLATED_ENV_SET)
+    return env
+
+
+def _claude_help(claude: str, env: dict, cwd: str) -> str:
+    """讀 ``claude --help`` 的說明文字（只是讀說明，不會送出任何請求）。讀不到就丟 ClaudeIsolationUnsupportedError。"""
+    try:
+        st = os.stat(claude)
+        key = (claude, st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if key is not None and key in _HELP_CACHE:
+        return _HELP_CACHE[key]
+    try:
+        proc = subprocess.run(
+            [claude, "--help"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=env, cwd=cwd, timeout=30, **_no_window_kwargs())
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise ClaudeIsolationUnsupportedError(
+            f"無法讀取 claude --help 來確認隔離模式需要的旗標（{e}），所以不執行。") from e
+    text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    if proc.returncode != 0 or "--print" not in text:
+        raise ClaudeIsolationUnsupportedError(
+            f"claude --help 沒有正常回應（exit {proc.returncode}），無法確認隔離模式需要的旗標，所以不執行。")
+    if key is not None:
+        _HELP_CACHE[key] = text
+    return text
+
+
+def _require_isolation_support(claude: str, cmd: list, env: dict, cwd: str) -> None:
+    """argv 裡每一個 ``--旗標``（加上 dontAsk 這個權限模式）都要在 claude --help 裡查得到，否則明確報錯。"""
+    needed = []
+    for token in cmd[1:]:
+        flag = token.split("=", 1)[0]
+        if re.fullmatch(r"--[A-Za-z][\w-]*", flag) and flag not in needed:
+            needed.append(flag)
+    needed.append("dontAsk")
+    help_text = _claude_help(claude, env, cwd)
+    missing = [f for f in needed if not re.search(r"(?<![\w-])" + re.escape(f) + r"(?![\w-])", help_text)]
+    if missing:
+        raise ClaudeIsolationUnsupportedError(
+            "這版 claude 不支援隔離模式需要的旗標："
+            f"{', '.join(missing)}。請更新 Claude Code（`claude update`）後再試；隔離模式不會放寬照跑。",
+            missing=missing)
+
+
+@contextlib.contextmanager
+def _workspace(isolated: bool):
+    """isolated=True：開一個新的暫存資料夾（底下 work/ 是空的工作目錄、tmp/ 給 TEMP），用完整個刪掉。
+    isolated=False：什麼都不做，yield None。"""
+    if not isolated:
+        yield None
+        return
+    root = tempfile.mkdtemp(prefix="claude-iso-")
+    try:
+        os.mkdir(os.path.join(root, "work"))
+        os.mkdir(os.path.join(root, "tmp"))
+        yield root
+    finally:
+        _remove_tree(root)
+
+
+def _remove_tree(path: str, attempts: int = 5) -> None:
+    """刪掉暫存資料夾。Windows 上子程序剛結束時檔案可能還被占用，稍等重試；唯讀檔先改可寫。"""
+
+    def _force(func, target, _exc):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass
+
+    for attempt in range(attempts):
+        shutil.rmtree(path, onerror=_force)
+        if not os.path.exists(path):
+            return
+        time.sleep(0.2 * (attempt + 1))
+    print(f"[claude_subscription] 警告：隔離模式的暫存資料夾刪不掉，請手動刪除：{path}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- #
+# 3c. 隔離的網路搜尋員
+# --------------------------------------------------------------------------- #
+_SEARCH_SYSTEM = (
+    "你是網路搜尋助手。用 WebSearch 工具查詢使用者的問題，只根據搜尋結果簡潔作答，"
+    "用提問的語言回答。最後一段寫「來源：」，每行一個 markdown 連結 [標題](網址)，"
+    "只列搜尋結果裡真的出現過的網址。"
+)
+_MD_LINK_RE = re.compile(r"\[([^\]\n]{1,300})\]\((https?://[^\s)]+)\)")
+_BARE_URL_RE = re.compile(r"https?://[^\s<>\"'\)\]]+")
+_HIT_RE = re.compile(
+    r'"title"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"url"\s*:\s*"(https?://(?:[^"\\]|\\.)*)"')
+
+
+def _norm_url(url: str) -> str:
+    return url.strip().rstrip(".,;:!?、，。").rstrip("/")
+
+
+def _collect_hits(node, hits: dict) -> None:
+    """從工具結果（user 事件）裡撈出搜尋結果的網址與標題：結構化的 {title, url} 或字串裡的 JSON 片段都收。"""
+    if isinstance(node, dict):
+        url = node.get("url")
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            hits.setdefault(_norm_url(url), (str(node.get("title") or ""), url))
+        for value in node.values():
+            _collect_hits(value, hits)
+    elif isinstance(node, list):
+        for value in node:
+            _collect_hits(value, hits)
+    elif isinstance(node, str) and '"url"' in node:
+        for title, url in _HIT_RE.findall(node):
+            try:
+                title = json.loads(f'"{title}"')
+                url = json.loads(f'"{url}"')
+            except json.JSONDecodeError:
+                pass
+            hits.setdefault(_norm_url(url), (title, url))
+
+
+def _cited_links(text: str) -> list:
+    """答案文字裡引用的連結（markdown 連結優先，再補裸網址），照出現順序、去重。"""
+    found: dict = {}
+    for title, url in _MD_LINK_RE.findall(text or ""):
+        found.setdefault(_norm_url(url), (title.strip(), url.strip()))
+    for url in _BARE_URL_RE.findall(_MD_LINK_RE.sub(" ", text or "")):
+        url = url.rstrip(".,;:!?、，。")
+        found.setdefault(_norm_url(url), ("", url))
+    return list(found.items())
+
+
+def _pick_sources(text: str, hits: dict) -> list:
+    """來源：答案引用、且真的出現在搜尋結果裡的網址；答案沒引用就用全部搜尋結果。
+    讀不到搜尋結果（格式變了）時，退而用答案引用的網址。"""
+    cited = _cited_links(text)
+    if not hits:
+        return [{"title": title, "url": url} for _key, (title, url) in cited]
+    picked = [{"title": title or hits[key][0], "url": url} for key, (title, url) in cited if key in hits]
+    if picked:
+        return picked
+    return [{"title": title, "url": url} for title, url in hits.values()]
+
+
+def search(
+    query: str,
+    *,
+    isolated: bool = True,
+    model: str = "haiku",
+    system: Optional[str] = _SEARCH_SYSTEM,
+    max_budget_usd: Optional[float] = None,
+    timeout: int = 180,
+    binary: Optional[str] = None,
+    auth: str = "subscription",
+    on_event: Optional[Callable[[dict], None]] = None,
+) -> dict:
+    """叫一個只能上網搜尋的 Claude Code 搜尋員，回傳 ``{"text": 答案, "sources": [{"title", "url"}, ...]}``。
+
+    isolated=True（預設）：走 ask_stream(isolated=True, tools="WebSearch")——不讀使用者設定、
+    CLAUDE.md、記憶，不載入 MCP，只開 WebSearch（不開 WebFetch），空暫存資料夾、不留 session、
+    環境變數白名單。這版 claude 不支援需要的旗標時丟 ClaudeIsolationUnsupportedError。
+    isolated=False：一樣只開 WebSearch、dontAsk，但沿用這台電腦的 Claude Code 設定（CLAUDE.md、MCP 等）。
+
+    sources 只收「答案引用、而且真的出現在 WebSearch 結果裡」的網址；答案沒引用就給全部搜尋結果。
+    on_event：想看進度就給（跟 ask_stream 一樣）；它丟的例外不會中斷搜尋。
+    例外跟 ask() 相同；query 是空的丟 ValueError。
+    """
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("search() 的 query 不能是空的。")
+    hits: dict = {}
+
+    def _watch(event: dict) -> None:
+        if event.get("type") == "user":
+            _collect_hits(event, hits)
+        if on_event is not None:
+            on_event(event)
+
+    if isolated:
+        result = ask_stream(query, _watch, model=model, system=system, max_budget_usd=max_budget_usd,
+                            tools="WebSearch", timeout=timeout, binary=binary, auth=auth, isolated=True)
+    else:
+        result = ask_stream(query, _watch, model=model, system=system, max_budget_usd=max_budget_usd,
+                            tools="WebSearch", permission_mode="dontAsk", timeout=timeout, binary=binary,
+                            auth=auth, extra_args=["--allowedTools", "WebSearch",
+                                                   "--disallowedTools", "WebFetch"])
+    return {"text": result.text, "sources": _pick_sources(result.text, hits)}
 
 
 def _no_window_kwargs() -> dict:
@@ -659,17 +984,20 @@ def _raise_process_failure(returncode: int, stderr: str, stdout: str):
     raise ClaudeError(detail)
 
 
-def _result_from(payload: dict, stdout: str, stderr: str) -> ClaudeResult:
-    """claude 的 result JSON（json 模式整包、stream-json 模式最後一個事件）→ ClaudeResult，或丟出對應的例外。"""
+def _result_from(payload: dict, stdout: str, stderr: str, *, redact: bool = False) -> ClaudeResult:
+    """claude 的 result JSON（json 模式整包、stream-json 模式最後一個事件）→ ClaudeResult，或丟出對應的例外。
+
+    redact=True（隔離模式）：錯誤訊息只附 claude 的錯誤說明，不附 stdout 原文（可能帶到查詢內容）。"""
     if payload.get("is_error") or payload.get("subtype") != "success":
         said = str(payload.get("result") or "").strip()
         limit = _usage_limit(said, payload.get("api_error_status"))
         if limit is not None:
             raise limit
         # 要看的是 claude 最後說了什麼（result）；stream-json 的開頭是 init 事件（一長串工具清單），沒用
+        fallback = "" if redact else stdout[-1000:]
         detail = (
             f"Claude 回報錯誤：subtype={payload.get('subtype')}, "
-            f"api_error_status={payload.get('api_error_status')}\n{said[:1000] or stdout[-1000:]}"
+            f"api_error_status={payload.get('api_error_status')}\n{said[:1000] or fallback}"
         )
         # 401/403 是明確的認證失敗；其餘再用關鍵字啟發式判斷。
         if payload.get("api_error_status") in (401, 403) or _looks_like_auth_failure(
@@ -860,6 +1188,12 @@ def _build_parser() -> _ArgParser:
         "否則它會在呼叫你程式的資料夾裡讀寫檔案。",
     )
     agent.add_argument(
+        "--isolated",
+        action="store_true",
+        help="隔離模式：不讀使用者設定／CLAUDE.md／記憶、不載入 MCP，空暫存資料夾、不留 session、"
+        '環境變數白名單。--tools 只能是 "" 或 WebSearch；不能和 --cwd、session 旗標、--claude-arg 合用。',
+    )
+    agent.add_argument(
         "--claude-arg",
         action="append",
         default=[],
@@ -1029,6 +1363,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             persist=args.persist or args.continue_last,
             cwd=args.cwd,
             extra_args=extra or None,
+            isolated=args.isolated,
         )
     except ClaudeNotFoundError as e:  # 必須排在 FileNotFoundError 之前
         print(f"[claude_subscription] 錯誤：{e}", file=sys.stderr)
