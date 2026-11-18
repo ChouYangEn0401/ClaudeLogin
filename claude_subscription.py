@@ -51,6 +51,8 @@ claude_subscription.py
 1. Python 程式內：``from claude_subscription import ask``
 2. 任何語言（shell out）：``python claude_subscription.py --model haiku "你的提示"``
 3. 新電腦先自我診斷：``python claude_subscription.py --check``
+4. 乾淨、只能上網搜尋的搜尋員：``from claude_subscription import search``；
+   ``search(query)`` 回傳 ``{"text", "sources"}``（隔離模式，見 ask() 的 ``isolated``）。
 """
 
 from __future__ import annotations
@@ -73,7 +75,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 __all__ = [
     "ask",

@@ -5,6 +5,14 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-18
+
+### Added
+- 隔離模式：`ask()`／`ask_stream()` 新增 `isolated=False`（預設不變），CLI 新增 `--isolated`。隔離時不讀使用者／專案設定、CLAUDE.md、自動記憶，不載入 MCP、skills、hooks；工具只能是 `""` 或 `WebSearch`、權限模式固定 `dontAsk`；在新開的空暫存資料夾裡跑、跑完刪掉；不保存 session；子程序環境變數改成白名單（不帶其他金鑰）；錯誤訊息不附 claude 的原始輸出。
+- 用到的每個旗標都會先到 `claude --help` 確認；這版 claude 不支援時丟新的 `ClaudeIsolationUnsupportedError`（CLI 結束碼 1），不會少帶旗標照跑。
+- `search(query, *, isolated=True) -> {"text", "sources"}`：只能上網搜尋的搜尋員；`sources` 只收答案引用、而且真的出現在 WebSearch 結果裡的網址。
+- `tests/test_isolated.py`：用假子程序驗證隔離模式的參數、環境、工作目錄與 `search()`（不呼叫 Claude、不連網）。
+
 ## [0.3.2] - 2026-11-17
 
 ### Fixed
