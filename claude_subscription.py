@@ -608,7 +608,7 @@ def _run_stream(claude, cmd, env, prompt, cwd, timeout, on_event, *, redact: boo
 
     def _kill_on_timeout():
         timed_out.set()
-        proc.kill()
+        _kill_tree(proc)
 
     timer = threading.Timer(timeout, _kill_on_timeout)
     timer.daemon = True
@@ -641,6 +641,12 @@ def _run_stream(claude, cmd, env, prompt, cwd, timeout, on_event, *, redact: boo
         proc.wait()
     finally:
         timer.cancel()
+        # 讀到一半出事（Ctrl+C、on_event 丟 BaseException、讀取錯誤）時子程序還活著：
+        # 先殺掉再離開，否則 claude 會在背景繼續跑，隔離模式的暫存資料夾在 Windows 也刪不掉。
+        if proc.poll() is None:
+            _kill_tree(proc)
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5)
     reader.join(5)
     stderr = "".join(stderr_parts)
     stdout = "\n".join(lines)
@@ -652,6 +658,27 @@ def _run_stream(claude, cmd, env, prompt, cwd, timeout, on_event, *, redact: boo
         shown = "（隔離模式不附原始輸出）" if redact else f"\nstdout:\n{stdout[-2000:]}"
         raise ClaudeError(f"claude 沒有送出 result 事件。{shown}")
     return _result_from(final, stdout, stderr, redact=redact)
+
+
+def _kill_tree(proc) -> None:
+    """結束子程序，Windows 上連它開的子程序一起結束；已經結束就什麼都不做。
+
+    npm 裝的 ``claude.cmd`` 是 cmd.exe 包著 node：``proc.kill()`` 只殺得到 cmd.exe，node 會留下來，
+    還握著 stdout，讀取端就一直等不到結束。所以 Windows 先用 ``taskkill /T /F`` 依 pid 殺整棵樹
+    （要在父程序還活著時做，才找得到子程序），再補一次 ``proc.kill()``。"""
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32" and isinstance(proc.pid, int):
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                           **_no_window_kwargs())
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
 
 
 def _prepare(prompt: str, output_format: str, *, model, system, json_schema, max_budget_usd, tools,
