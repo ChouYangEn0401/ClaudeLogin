@@ -838,16 +838,42 @@ def _claude_help(claude: str, env: dict, cwd: str) -> str:
     return text
 
 
+def _help_options(help_text: str) -> dict:
+    """把 ``claude --help`` 拆成 {旗標: 那個選項的說明}。
+
+    只認「選項宣告行」：縮排後以 ``-`` 開頭的行，宣告部分到第一個兩格以上的空白為止
+    （例：``--allowedTools, --allowed-tools <tools...>``，兩個名字都算）。說明換行接續的行
+    （有縮排、不以 ``-`` 開頭）併進同一個選項的說明。旗標只出現在別的旗標的說明裡不算。"""
+    options: dict = {}
+    current: list = []
+    for line in help_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("-"):
+            parts = re.split(r"\s{2,}", stripped, maxsplit=1)
+            decl, desc = parts[0], (parts[1] if len(parts) > 1 else "")
+            current = re.findall(r"(?<![\w-])--?[A-Za-z][\w-]*", decl)
+            for name in current:
+                options[name] = desc
+        elif stripped and line[:1].isspace() and current:
+            for name in current:
+                options[name] += " " + stripped
+        else:
+            current = []
+    return options
+
+
 def _require_isolation_support(claude: str, cmd: list, env: dict, cwd: str) -> None:
-    """argv 裡每一個 ``--旗標``（加上 dontAsk 這個權限模式）都要在 claude --help 裡查得到，否則明確報錯。"""
+    """argv 裡每一個 ``--旗標`` 都要是 claude --help 裡的選項宣告，``--permission-mode`` 的說明裡
+    也要列出 dontAsk，否則明確報錯。"""
     needed = []
     for token in cmd[1:]:
         flag = token.split("=", 1)[0]
         if re.fullmatch(r"--[A-Za-z][\w-]*", flag) and flag not in needed:
             needed.append(flag)
-    needed.append("dontAsk")
-    help_text = _claude_help(claude, env, cwd)
-    missing = [f for f in needed if not re.search(r"(?<![\w-])" + re.escape(f) + r"(?![\w-])", help_text)]
+    options = _help_options(_claude_help(claude, env, cwd))
+    missing = [f for f in needed if f not in options]
+    if not re.search(r"(?<![\w-])dontAsk(?![\w-])", options.get("--permission-mode", "")):
+        missing.append("dontAsk")
     if missing:
         raise ClaudeIsolationUnsupportedError(
             "這版 claude 不支援隔離模式需要的旗標："
