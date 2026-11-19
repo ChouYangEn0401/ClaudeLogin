@@ -696,6 +696,7 @@ def _prepare(prompt: str, output_format: str, *, model, system, json_schema, max
         raise ValueError(f"未知的 auth 模式：{auth!r}（可用：subscription / apikey / auto）")
     if isolated:
         tools, permission_mode = _check_isolated_args(
+            model=model, system=system,
             tools=tools, permission_mode=permission_mode, auth=auth, resume=resume,
             session_id=session_id, persist=persist, cwd=cwd, extra_args=extra_args)
 
@@ -766,8 +767,14 @@ def _prepare(prompt: str, output_format: str, *, model, system, json_schema, max
 # --------------------------------------------------------------------------- #
 # 3b. 隔離模式的零件
 # --------------------------------------------------------------------------- #
-def _check_isolated_args(*, tools, permission_mode, auth, resume, session_id, persist, cwd, extra_args):
+def _check_isolated_args(*, tools, permission_mode, auth, resume, session_id, persist, cwd, extra_args,
+                         model=None, system=None):
     """隔離模式不接受會削弱隔離的參數；回傳正規化後的 (tools, permission_mode)。不合就丟 ValueError。"""
+    # model／system 直接接在 --model／--system-prompt 後面；以 - 開頭的值可能被 claude 當成另一個旗標。
+    for name, value in (("model", model), ("system", system)):
+        if isinstance(value, str) and value.startswith("-"):
+            raise ValueError(f"隔離模式的 {name} 不能以 - 開頭（會被當成旗標）。"
+                             "系統提示真的要以 - 開頭的話，前面加一個換行。")
     tools = (tools or "").strip()
     if tools not in _ISOLATED_TOOLS:
         raise ValueError(f"隔離模式的 tools 只能是 \"\" 或 \"WebSearch\"，收到 {tools!r}。")
