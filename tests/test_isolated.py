@@ -496,9 +496,11 @@ class TestNoQueryLeak(IsoCase):
 # 8. ask_stream 與 search()
 # --------------------------------------------------------------------------- #
 class FakePopen:
+    """假的 claude 子程序。pid 預設 None：測試永遠不會拿假的 pid 去叫真的 taskkill。"""
+
     instances: list = []
 
-    def __init__(self, cmd, lines=(), returncode=0, **kwargs):
+    def __init__(self, cmd, lines=(), returncode=0, err_text="", pid=None, **kwargs):
         self.cmd = list(cmd)
         self.kwargs = kwargs
         cwd = kwargs.get("cwd")
@@ -508,19 +510,24 @@ class FakePopen:
         self._lines = [line + "\n" for line in lines]
         self.returncode = None
         self._rc = returncode
-        self.stderr = io.StringIO("")
+        self.stderr = io.StringIO(err_text)
+        self.pid = pid
+        self.killed = False
         FakePopen.instances.append(self)
 
     @property
     def stdout(self):
         yield from self._lines
 
+    def poll(self):
+        return self.returncode
+
     def wait(self, timeout=None):
-        self.returncode = self._rc
+        self.returncode = -9 if self.killed else self._rc
         return self.returncode
 
     def kill(self):
-        pass
+        self.killed = True
 
 
 SEARCH_LINKS = json.dumps([
@@ -598,9 +605,10 @@ class TestSearch(StreamCase):
             "https://docs.python.org/3/whatsnew/3.13.html", "https://www.python.org/downloads/"])
         self.assertEqual(out["sources"][0]["title"], "Python 3.13 release notes")
 
-    def test_unknown_result_format_keeps_cited_links(self):
+    def test_unknown_result_format_gives_no_sources(self):
+        """（待擁有者確認的語意）讀不到搜尋結果時回空清單，不回答案裡未驗證的網址。"""
         out, _ = self.run_search("見 https://example.org/a.", links="(no links)")
-        self.assertEqual(out["sources"], [{"title": "", "url": "https://example.org/a"}])
+        self.assertEqual(out["sources"], [])
 
     def test_bare_url_matches_hit_with_trailing_slash_difference(self):
         out, _ = self.run_search("見 https://www.python.org/downloads 。")
@@ -663,6 +671,206 @@ class TestCliIsolated(IsoCase):
                         redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
                     self.assertEqual(cs._main(argv), cs.EXIT_BAD_INPUT)
                     run.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# 10. 裁判審查後補的測試（每一條先在修正前的程式上失敗過）
+# --------------------------------------------------------------------------- #
+class TestStreamKillsChildOnAbort(IsoCase):
+    """讀取途中被中斷（Ctrl+C、on_event 丟 BaseException）時，子程序要被殺掉，暫存資料夾也要刪掉。"""
+
+    def _abort(self, platform_name, pid):
+        FakePopen.instances = []
+        factory = lambda cmd, **kw: FakePopen(cmd, search_stream("ok"), pid=pid, **kw)  # noqa: E731
+
+        def interrupt(_event):
+            raise KeyboardInterrupt
+
+        with mock.patch.object(cs.sys, "platform", platform_name), \
+                mock.patch.object(cs.subprocess, "Popen", side_effect=factory), \
+                mock.patch.object(cs.subprocess, "run") as run:
+            with self.assertRaises(KeyboardInterrupt):
+                cs.ask_stream("q", interrupt, isolated=True, tools="WebSearch")
+        return FakePopen.instances[-1], run
+
+    def test_child_killed_and_dir_removed_when_interrupted(self):
+        before = iso_dirs()
+        proc, run = self._abort("linux", pid=None)
+        self.assertTrue(proc.killed)
+        run.assert_not_called()                         # 非 Windows 不叫 taskkill
+        self.assertFalse(os.path.exists(proc.kwargs["cwd"]))
+        self.assertEqual(iso_dirs(), before)
+
+    def test_windows_kills_the_whole_tree(self):
+        """npm 的 claude.cmd 是 cmd.exe 包著 node：只殺 cmd.exe 的話 node 會留下來。"""
+        proc, run = self._abort("win32", pid=4242)
+        self.assertTrue(proc.killed)
+        self.assertEqual(run.call_args.args[0], ["taskkill", "/T", "/F", "/PID", "4242"])
+
+    def test_finished_child_is_not_killed(self):
+        FakePopen.instances = []
+        factory = lambda cmd, **kw: FakePopen(cmd, search_stream("ok"), pid=4242, **kw)  # noqa: E731
+        with mock.patch.object(cs.sys, "platform", "win32"), \
+                mock.patch.object(cs.subprocess, "Popen", side_effect=factory), \
+                mock.patch.object(cs.subprocess, "run") as run:
+            cs.ask_stream("q", lambda e: None, isolated=True, tools="WebSearch")
+        self.assertFalse(FakePopen.instances[-1].killed)
+        run.assert_not_called()
+
+
+class TestIsolatedErrorsAreRedacted(IsoCase):
+    """隔離模式的錯誤訊息只說結束碼與錯誤類別，不附 claude 的 stderr／result 原文。"""
+
+    CANARY = "canary-query-42"
+
+    def _stream(self, lines=(), returncode=0, err_text=""):
+        factory = lambda cmd, **kw: FakePopen(cmd, lines, returncode, err_text, **kw)  # noqa: E731
+        with mock.patch.object(cs.subprocess, "Popen", side_effect=factory):
+            cs.ask_stream("q", lambda e: None, isolated=True)
+
+    def test_process_failure_stderr_not_in_message(self):
+        fake = FakeRun(stdout="", returncode=1, stderr=f"Error: something about {self.CANARY}")
+        with self.assertRaises(cs.ClaudeError) as ctx:
+            self.run_ask(fake, isolated=True)
+        self.assertNotIn(self.CANARY, str(ctx.exception))
+        self.assertIn("exit 1", str(ctx.exception))
+        self.assertFalse(os.path.exists(fake.calls[-1]["kwargs"]["cwd"]))
+
+    def test_stream_process_failure_stderr_not_in_message(self):
+        with self.assertRaises(cs.ClaudeError) as ctx:
+            self._stream(returncode=2, err_text=f"crash {self.CANARY}")
+        self.assertNotIn(self.CANARY, str(ctx.exception))
+
+    def test_auth_failure_still_classified_but_redacted(self):
+        fake = FakeRun(stdout="", returncode=1, stderr=f"Please log in again {self.CANARY}")
+        with self.assertRaises(cs.ClaudeAuthError) as ctx:
+            self.run_ask(fake, isolated=True)
+        self.assertNotIn(self.CANARY, str(ctx.exception))
+
+    def test_usage_limit_still_classified_but_redacted(self):
+        fake = FakeRun(stdout="", returncode=1, stderr=f"You've hit your limit {self.CANARY} · resets 7pm")
+        with self.assertRaises(cs.ClaudeUsageLimitError) as ctx:
+            self.run_ask(fake, isolated=True)
+        self.assertNotIn(self.CANARY, str(ctx.exception))
+        self.assertEqual(ctx.exception.resets, "7pm")
+
+    def test_error_result_text_not_in_message(self):
+        payload = make_payload(subtype="success", is_error=True, api_error_status=500,
+                               result=f"API Error: model said {self.CANARY}")
+        with self.assertRaises(cs.ClaudeError) as ctx:
+            self.run_ask(FakeRun(stdout=json.dumps(payload)), isolated=True)
+        self.assertNotIn(self.CANARY, str(ctx.exception))
+        self.assertIn("500", str(ctx.exception))
+
+    def test_stream_error_result_text_not_in_message(self):
+        bad = json.dumps(make_payload(type="result", subtype="error_during_execution", is_error=True,
+                                      result=f"partial answer {self.CANARY}"))
+        with self.assertRaises(cs.ClaudeError) as ctx:
+            self._stream(lines=[bad])
+        self.assertNotIn(self.CANARY, str(ctx.exception))
+
+    def test_non_isolated_failure_still_shows_stderr(self):
+        fake = FakeRun(stdout="", returncode=1, stderr=f"boom {self.CANARY}")
+        with self.assertRaises(cs.ClaudeError) as ctx:
+            self.run_ask(fake)
+        self.assertIn(self.CANARY, str(ctx.exception))
+
+
+class TestFlagDetectionUsesDeclarations(IsoCase):
+    """旗標只算「選項宣告」那一行；只在別的旗標的說明裡被提到不算。"""
+
+    def _expect_missing(self, missing):
+        with mock.patch.object(cs.subprocess, "run") as run, \
+                self.assertRaises(cs.ClaudeIsolationUnsupportedError) as ctx:
+            cs.ask("q", isolated=True)
+        run.assert_not_called()
+        self.assertEqual(ctx.exception.missing, missing)
+
+    def test_flag_only_mentioned_in_another_description(self):
+        self.help_text = FAKE_HELP.replace(
+            "  --safe-mode\n", "").replace("  --restricted", "  --restricted  stricter than --safe-mode")
+        self._expect_missing(["--safe-mode"])
+
+    def test_dontask_only_mentioned_elsewhere(self):
+        self.help_text = FAKE_HELP.replace(', "dontAsk"', "").replace(
+            "  --no-chrome", "  --no-chrome  (unrelated: dontAsk)")
+        self._expect_missing(["dontAsk"])
+
+    def test_wrapped_description_still_counts(self):
+        self.help_text = FAKE_HELP.replace(
+            '  --permission-mode <mode>  (choices: "acceptEdits", "auto", "dontAsk", "plan")',
+            '  --permission-mode <mode>  Permission mode (choices: "acceptEdits",\n'
+            '                            "auto", "dontAsk", "plan")')
+        _r, call = self.run_ask(isolated=True)
+        self.assertIn("--safe-mode", call["cmd"])
+
+    def test_alias_on_the_same_declaration_counts(self):
+        _r, call = self.run_ask(isolated=True, tools="WebSearch")   # --allowedTools, --allowed-tools
+        self.assertIn("--allowedTools", call["cmd"])
+
+
+class TestIsolatedRejectsDashValues(IsoCase):
+    """隔離模式不讓 model／system 的值長得像旗標（怕被 claude 當成另一個旗標）。"""
+
+    def test_dash_values_rejected_before_running(self):
+        for kwargs in ({"model": "--dangerously-skip-permissions"}, {"model": "-x"},
+                       {"system": "--add-dir=/"}, {"system": "- rule one"}):
+            with self.subTest(**kwargs), mock.patch.object(cs.subprocess, "run") as run, \
+                    mock.patch.object(cs.subprocess, "Popen") as popen:
+                with self.assertRaises(ValueError):
+                    cs.ask("q", isolated=True, **kwargs)
+                with self.assertRaises(ValueError):
+                    cs.ask_stream("q", lambda e: None, isolated=True, **kwargs)
+                run.assert_not_called()
+                popen.assert_not_called()
+
+    def test_normal_values_and_default_mode_unaffected(self):
+        _r, call = self.run_ask(isolated=True, model="claude-haiku-4-5", system="\n- rule one")
+        self.assertEqual(call["cmd"][call["cmd"].index("--model") + 1], "claude-haiku-4-5")
+        _r, call = self.run_ask(system="- rule one")                 # 非隔離：照舊
+        self.assertEqual(call["cmd"][call["cmd"].index("--system-prompt") + 1], "- rule one")
+
+
+WIKI_URL = "https://en.wikipedia.org/wiki/Python_(programming_language)"
+WIKI_LINKS = json.dumps([{"title": "Python (programming language)", "url": WIKI_URL},
+                         {"title": "Python downloads", "url": "https://www.python.org/downloads/"}])
+
+
+def stream_without_search(answer: str) -> list:
+    """模型根本沒搜尋（沒有 user 事件），直接回答。"""
+    return [
+        json.dumps({"type": "system", "subtype": "init", "tools": ["WebSearch"]}),
+        json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": answer}]}}),
+        json.dumps(make_payload(type="result", result=answer)),
+    ]
+
+
+class TestSourcesReview(StreamCase):
+    def test_markdown_link_with_parentheses(self):
+        out, _ = self.run_search(f"見 [維基]({WIKI_URL})。", links=WIKI_LINKS)
+        self.assertEqual(out["sources"], [{"title": "維基", "url": WIKI_URL}])
+
+    def test_bare_url_with_parentheses(self):
+        out, _ = self.run_search(f"見 {WIKI_URL} 。", links=WIKI_LINKS)
+        self.assertEqual([s["url"] for s in out["sources"]], [WIKI_URL])
+
+    def test_bare_url_inside_plain_parentheses(self):
+        out, _ = self.run_search("(見 https://www.python.org/downloads/)")
+        self.assertEqual([s["url"] for s in out["sources"]], ["https://www.python.org/downloads/"])
+
+    def test_only_unverified_citations_fall_back_to_search_results(self):
+        """引用的全都對不上：退回搜尋結果（都是驗證過的網址），不回編造的網址。"""
+        out, _ = self.run_search("見 [編的](https://made-up.example/x)。")
+        self.assertEqual([s["url"] for s in out["sources"]], [
+            "https://docs.python.org/3/whatsnew/3.13.html", "https://www.python.org/downloads/"])
+
+    def test_no_search_results_means_no_sources(self):
+        """（待擁有者確認的語意）沒有任何搜尋結果時，不把答案裡未驗證的網址當來源。"""
+        FakePopen.instances = []
+        lines = stream_without_search("見 [官方](https://made-up.example/page)。")
+        with mock.patch.object(cs.subprocess, "Popen", side_effect=lambda cmd, **kw: FakePopen(cmd, lines, **kw)):
+            out = cs.search("q")
+        self.assertEqual(out["sources"], [])
 
 
 if __name__ == "__main__":

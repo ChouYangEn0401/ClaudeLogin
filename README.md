@@ -346,7 +346,8 @@ for s in r["sources"]:                               # [{"title": ..., "url": ..
 timeout=180, binary=None, auth="subscription", on_event=None) -> {"text": str, "sources": list}`
 
 - `sources` 只收「答案有引用、**而且真的出現在 WebSearch 結果裡**」的網址（擋掉模型自己編的網址）；
-  答案沒引用任何網址時，給全部搜尋結果；讀不到搜尋結果的格式時，退而用答案裡的網址。
+  答案沒引用任何網址、或引用的網址都對不上搜尋結果時，給全部搜尋結果（都是驗證過的網址）；
+  **沒有任何搜尋結果**（模型沒搜尋、或讀不到搜尋結果的格式）時，`sources` 是空清單，不收答案裡未驗證的網址。
 - `on_event` 可以拿來顯示進度（跟 `ask_stream` 一樣）。
 - `isolated=False`：一樣只開 WebSearch、`dontAsk`，但會沿用這台電腦的 Claude Code 設定。
 
@@ -368,13 +369,23 @@ CLI `claude-sub --isolated [--tools WebSearch] "……"`。
 | 不把查詢寫進日誌 | 查詢走 stdin（不在命令列、不在環境變數）；本工具不寫任何日誌；隔離模式的錯誤訊息不附 claude 的原始輸出；另外設 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 關掉遙測與錯誤回報 |
 
 **版本不支援就報錯，不放寬**：每次隔離呼叫前，會先讀 `claude --help`（只讀說明，不送請求；
-同一個執行檔只讀一次），確認這次要用的**每一個**旗標都存在。缺任何一個就丟
+同一個執行檔只讀一次），確認這次要用的**每一個**旗標都有自己的選項宣告行（只在別的旗標說明裡被提到不算），
+`--permission-mode` 的說明裡也列出 `dontAsk`。缺任何一個就丟
 `ClaudeIsolationUnsupportedError`（`.missing` 列出缺哪些；CLI 結束碼 1），請先 `claude update`。
+讀 `--help` 最多等 30 秒，**不算在 `timeout` 裡**：同一個執行檔第一次隔離呼叫最長可能花 `timeout`＋30 秒。
 
 **不能一起用**（丟 `ValueError`，CLI 結束碼 4）：`cwd`、`resume`、`session_id`、`persist`、
 `extra_args`（CLI 的 `--cwd`、`--resume`、`--session`、`--continue`、`--persist`、`--claude-arg`），
-`tools` 不是 `""`／`WebSearch`，`permission_mode` 不是 `dontAsk`，以及 `auth="auto"`
-（隔離模式要確定只傳哪一個憑證，所以只支援 `subscription`、`apikey`）。
+`tools` 不是 `""`／`WebSearch`，`permission_mode` 不是 `dontAsk`，`auth="auto"`
+（隔離模式要確定只傳哪一個憑證，所以只支援 `subscription`、`apikey`），
+以及以 `-` 開頭的 `model`／`system`（可能被 claude 當成旗標；系統提示真的要以 `-` 開頭就在前面加一個換行）。
+
+**錯誤訊息**：隔離模式的例外只寫結束碼或 `subtype`／`api_error_status`，不附 claude 的 stderr、
+`result` 或 stdout 原文；錯誤類別照常分（`ClaudeAuthError`、`ClaudeUsageLimitError`，重置時間在 `.resets`）。
+
+**中斷與逾時**：`ask_stream()`／`search()` 讀到一半被中斷（Ctrl+C、`on_event` 丟出 `KeyboardInterrupt` 等）
+或逾時時，會先結束 claude 子程序再刪暫存資料夾；Windows 上用 `taskkill /T` 連子程序一起結束
+（npm 裝的 `claude.cmd` 是 cmd.exe 包著 node）。
 
 **限制（請知道）**
 
@@ -386,6 +397,11 @@ CLI `claude-sub --isolated [--tools WebSearch] "……"`。
 - `auth="apikey"` 只傳 `ANTHROPIC_API_KEY`／`ANTHROPIC_BASE_URL`；Bedrock／Vertex／Foundry 需要的雲端憑證不會傳，隔離模式不支援這些供應商。
 - 公司網路要走 proxy 的話，`HTTPS_PROXY` 等變數會照傳（連網必要）；proxy 網址裡若含帳密，也會一起傳給子程序。
 - 隔離模式用到的旗標（`--safe-mode`、`--restricted` 等）是 Claude Code 較新版才有的；舊版會直接報錯。
+- 用 `CLAUDE_CONFIG_DIR` 把 Claude Code 的設定／登入放在別的資料夾的話：隔離模式**不會**傳這個變數，
+  claude 會回去找家目錄底下的預設位置，通常會得到 `ClaudeAuthError`（沒登入），或用到預設位置裡的另一組登入。
+  訂閱登入可以改用 `CLAUDE_CODE_OAUTH_TOKEN`（`claude setup-token` 取得）。
+- `ask(..., isolated=True)`（非串流）逾時時，靠 Python 的 `subprocess.run` 結束子程序；若 claude 是 npm 的
+  `claude.cmd`，只結束得到外層 cmd.exe，可能要等 node 自己結束才回來。要確定逾時能殺乾淨，請用 `ask_stream()`／`search()`。
 
 ---
 

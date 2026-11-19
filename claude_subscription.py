@@ -384,13 +384,18 @@ _LIMIT_RE = re.compile(r"(?i)(hit your (?:\w+ )?limit|usage limit|limit (?:reach
 _RESETS_RE = re.compile(r"(?i)resets?\s*(?:at\s*)?([^·\n.;]{1,40})")
 
 
-def _usage_limit(text: str, status=None):
-    """是額度用完就回 ClaudeUsageLimitError，不是回 None。"""
+def _usage_limit(text: str, status=None, *, redact: bool = False):
+    """是額度用完就回 ClaudeUsageLimitError，不是回 None。
+
+    redact=True（隔離模式）：訊息不引用 claude 的原文，重置時間只放在 ``.resets``。"""
     text = " ".join(str(text or "").split())
     if status != 429 and not _LIMIT_RE.search(text):
         return None
     match = _RESETS_RE.search(text)
     resets = match.group(1).strip() if match else ""
+    if redact:
+        return ClaudeUsageLimitError(
+            "Claude 的使用額度用完了（隔離模式不附 claude 的原始輸出；重置時間見 .resets）。", resets=resets)
     shown = text[:200] if text else "HTTP 429"
     return ClaudeUsageLimitError(f"Claude 的使用額度用完了：{shown}", resets=resets)
 
@@ -528,7 +533,7 @@ def _run_json(claude, cmd, env, prompt, cwd, timeout, *, redact: bool) -> Claude
         raise ClaudeNotFoundError(f"無法執行 {claude}：{e}\n\n{_install_hint()}") from e
 
     if proc.returncode != 0:
-        _raise_process_failure(proc.returncode, proc.stderr, proc.stdout)
+        _raise_process_failure(proc.returncode, proc.stderr, proc.stdout, redact=redact)
 
     try:
         payload = json.loads(proc.stdout)
@@ -608,7 +613,7 @@ def _run_stream(claude, cmd, env, prompt, cwd, timeout, on_event, *, redact: boo
 
     def _kill_on_timeout():
         timed_out.set()
-        proc.kill()
+        _kill_tree(proc)
 
     timer = threading.Timer(timeout, _kill_on_timeout)
     timer.daemon = True
@@ -641,6 +646,12 @@ def _run_stream(claude, cmd, env, prompt, cwd, timeout, on_event, *, redact: boo
         proc.wait()
     finally:
         timer.cancel()
+        # 讀到一半出事（Ctrl+C、on_event 丟 BaseException、讀取錯誤）時子程序還活著：
+        # 先殺掉再離開，否則 claude 會在背景繼續跑，隔離模式的暫存資料夾在 Windows 也刪不掉。
+        if proc.poll() is None:
+            _kill_tree(proc)
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5)
     reader.join(5)
     stderr = "".join(stderr_parts)
     stdout = "\n".join(lines)
@@ -648,10 +659,31 @@ def _run_stream(claude, cmd, env, prompt, cwd, timeout, on_event, *, redact: boo
         raise ClaudeError(f"呼叫逾時（{timeout}s）。")
     if final is None:
         if proc.returncode != 0:
-            _raise_process_failure(proc.returncode, stderr, stdout)
+            _raise_process_failure(proc.returncode, stderr, stdout, redact=redact)
         shown = "（隔離模式不附原始輸出）" if redact else f"\nstdout:\n{stdout[-2000:]}"
         raise ClaudeError(f"claude 沒有送出 result 事件。{shown}")
     return _result_from(final, stdout, stderr, redact=redact)
+
+
+def _kill_tree(proc) -> None:
+    """結束子程序，Windows 上連它開的子程序一起結束；已經結束就什麼都不做。
+
+    npm 裝的 ``claude.cmd`` 是 cmd.exe 包著 node：``proc.kill()`` 只殺得到 cmd.exe，node 會留下來，
+    還握著 stdout，讀取端就一直等不到結束。所以 Windows 先用 ``taskkill /T /F`` 依 pid 殺整棵樹
+    （要在父程序還活著時做，才找得到子程序），再補一次 ``proc.kill()``。"""
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32" and isinstance(proc.pid, int):
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                           **_no_window_kwargs())
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
 
 
 def _prepare(prompt: str, output_format: str, *, model, system, json_schema, max_budget_usd, tools,
@@ -664,6 +696,7 @@ def _prepare(prompt: str, output_format: str, *, model, system, json_schema, max
         raise ValueError(f"未知的 auth 模式：{auth!r}（可用：subscription / apikey / auto）")
     if isolated:
         tools, permission_mode = _check_isolated_args(
+            model=model, system=system,
             tools=tools, permission_mode=permission_mode, auth=auth, resume=resume,
             session_id=session_id, persist=persist, cwd=cwd, extra_args=extra_args)
 
@@ -734,8 +767,14 @@ def _prepare(prompt: str, output_format: str, *, model, system, json_schema, max
 # --------------------------------------------------------------------------- #
 # 3b. 隔離模式的零件
 # --------------------------------------------------------------------------- #
-def _check_isolated_args(*, tools, permission_mode, auth, resume, session_id, persist, cwd, extra_args):
+def _check_isolated_args(*, tools, permission_mode, auth, resume, session_id, persist, cwd, extra_args,
+                         model=None, system=None):
     """隔離模式不接受會削弱隔離的參數；回傳正規化後的 (tools, permission_mode)。不合就丟 ValueError。"""
+    # model／system 直接接在 --model／--system-prompt 後面；以 - 開頭的值可能被 claude 當成另一個旗標。
+    for name, value in (("model", model), ("system", system)):
+        if isinstance(value, str) and value.startswith("-"):
+            raise ValueError(f"隔離模式的 {name} 不能以 - 開頭（會被當成旗標）。"
+                             "系統提示真的要以 - 開頭的話，前面加一個換行。")
     tools = (tools or "").strip()
     if tools not in _ISOLATED_TOOLS:
         raise ValueError(f"隔離模式的 tools 只能是 \"\" 或 \"WebSearch\"，收到 {tools!r}。")
@@ -806,16 +845,42 @@ def _claude_help(claude: str, env: dict, cwd: str) -> str:
     return text
 
 
+def _help_options(help_text: str) -> dict:
+    """把 ``claude --help`` 拆成 {旗標: 那個選項的說明}。
+
+    只認「選項宣告行」：縮排後以 ``-`` 開頭的行，宣告部分到第一個兩格以上的空白為止
+    （例：``--allowedTools, --allowed-tools <tools...>``，兩個名字都算）。說明換行接續的行
+    （有縮排、不以 ``-`` 開頭）併進同一個選項的說明。旗標只出現在別的旗標的說明裡不算。"""
+    options: dict = {}
+    current: list = []
+    for line in help_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("-"):
+            parts = re.split(r"\s{2,}", stripped, maxsplit=1)
+            decl, desc = parts[0], (parts[1] if len(parts) > 1 else "")
+            current = re.findall(r"(?<![\w-])--?[A-Za-z][\w-]*", decl)
+            for name in current:
+                options[name] = desc
+        elif stripped and line[:1].isspace() and current:
+            for name in current:
+                options[name] += " " + stripped
+        else:
+            current = []
+    return options
+
+
 def _require_isolation_support(claude: str, cmd: list, env: dict, cwd: str) -> None:
-    """argv 裡每一個 ``--旗標``（加上 dontAsk 這個權限模式）都要在 claude --help 裡查得到，否則明確報錯。"""
+    """argv 裡每一個 ``--旗標`` 都要是 claude --help 裡的選項宣告，``--permission-mode`` 的說明裡
+    也要列出 dontAsk，否則明確報錯。"""
     needed = []
     for token in cmd[1:]:
         flag = token.split("=", 1)[0]
         if re.fullmatch(r"--[A-Za-z][\w-]*", flag) and flag not in needed:
             needed.append(flag)
-    needed.append("dontAsk")
-    help_text = _claude_help(claude, env, cwd)
-    missing = [f for f in needed if not re.search(r"(?<![\w-])" + re.escape(f) + r"(?![\w-])", help_text)]
+    options = _help_options(_claude_help(claude, env, cwd))
+    missing = [f for f in needed if f not in options]
+    if not re.search(r"(?<![\w-])dontAsk(?![\w-])", options.get("--permission-mode", "")):
+        missing.append("dontAsk")
     if missing:
         raise ClaudeIsolationUnsupportedError(
             "這版 claude 不支援隔離模式需要的旗標："
@@ -865,8 +930,9 @@ _SEARCH_SYSTEM = (
     "用提問的語言回答。最後一段寫「來源：」，每行一個 markdown 連結 [標題](網址)，"
     "只列搜尋結果裡真的出現過的網址。"
 )
-_MD_LINK_RE = re.compile(r"\[([^\]\n]{1,300})\]\((https?://[^\s)]+)\)")
-_BARE_URL_RE = re.compile(r"https?://[^\s<>\"'\)\]]+")
+# 網址裡允許一層成對括號（例如維基百科的 /wiki/Foo_(bar)），不成對的右括號當作網址結束。
+_MD_LINK_RE = re.compile(r"\[([^\]\n]{1,300})\]\((https?://(?:[^\s()]|\([^\s()]*\))+)\)")
+_BARE_URL_RE = re.compile(r"https?://(?:[^\s<>\"'()\]]|\([^\s<>\"'()\]]*\))+")
 _HIT_RE = re.compile(
     r'"title"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"url"\s*:\s*"(https?://(?:[^"\\]|\\.)*)"')
 
@@ -908,11 +974,12 @@ def _cited_links(text: str) -> list:
 
 
 def _pick_sources(text: str, hits: dict) -> list:
-    """來源：答案引用、且真的出現在搜尋結果裡的網址；答案沒引用就用全部搜尋結果。
-    讀不到搜尋結果（格式變了）時，退而用答案引用的網址。"""
-    cited = _cited_links(text)
+    """來源：答案引用、且真的出現在搜尋結果裡的網址。答案沒引用、或引用的全都對不上時，用全部搜尋結果
+    （都是驗證過的網址）。沒有任何搜尋結果（模型沒搜尋、或結果格式變了）時回空清單——
+    絕不把答案裡未驗證的網址當來源。"""
     if not hits:
-        return [{"title": title, "url": url} for _key, (title, url) in cited]
+        return []
+    cited = _cited_links(text)
     picked = [{"title": title or hits[key][0], "url": url} for key, (title, url) in cited if key in hits]
     if picked:
         return picked
@@ -938,7 +1005,8 @@ def search(
     環境變數白名單。這版 claude 不支援需要的旗標時丟 ClaudeIsolationUnsupportedError。
     isolated=False：一樣只開 WebSearch、dontAsk，但沿用這台電腦的 Claude Code 設定（CLAUDE.md、MCP 等）。
 
-    sources 只收「答案引用、而且真的出現在 WebSearch 結果裡」的網址；答案沒引用就給全部搜尋結果。
+    sources 只收「答案引用、而且真的出現在 WebSearch 結果裡」的網址；答案沒引用（或引用的都對不上）
+    就給全部搜尋結果；沒有任何搜尋結果時是空清單（不收未驗證的網址）。
     on_event：想看進度就給（跟 ask_stream 一樣）；它丟的例外不會中斷搜尋。
     例外跟 ask() 相同；query 是空的丟 ValueError。
     """
@@ -974,11 +1042,15 @@ def _no_window_kwargs() -> dict:
     return {}
 
 
-def _raise_process_failure(returncode: int, stderr: str, stdout: str):
-    detail = f"claude 子程序失敗 (exit {returncode}).\nstderr:\n{(stderr or '').strip()}"
+def _raise_process_failure(returncode: int, stderr: str, stdout: str, *, redact: bool = False):
+    """子程序非 0 結束 → 對應的例外。redact=True（隔離模式）：只說結束碼與錯誤類別，不附 stderr 原文。"""
+    if redact:
+        detail = f"claude 子程序失敗 (exit {returncode})。（隔離模式不附 claude 的原始輸出）"
+    else:
+        detail = f"claude 子程序失敗 (exit {returncode}).\nstderr:\n{(stderr or '').strip()}"
     if _looks_like_auth_failure(stderr, stdout):
         raise ClaudeAuthError(detail)
-    limit = _usage_limit(f"{stderr or ''} {(stdout or '')[-2000:]}")
+    limit = _usage_limit(f"{stderr or ''} {(stdout or '')[-2000:]}", redact=redact)
     if limit is not None:
         raise limit
     raise ClaudeError(detail)
@@ -987,18 +1059,20 @@ def _raise_process_failure(returncode: int, stderr: str, stdout: str):
 def _result_from(payload: dict, stdout: str, stderr: str, *, redact: bool = False) -> ClaudeResult:
     """claude 的 result JSON（json 模式整包、stream-json 模式最後一個事件）→ ClaudeResult，或丟出對應的例外。
 
-    redact=True（隔離模式）：錯誤訊息只附 claude 的錯誤說明，不附 stdout 原文（可能帶到查詢內容）。"""
+    redact=True（隔離模式）：錯誤訊息只有 subtype 與 api_error_status，不附 result 與 stdout 原文
+    （result 可能是模型的部分回答、或重述了查詢）。"""
     if payload.get("is_error") or payload.get("subtype") != "success":
         said = str(payload.get("result") or "").strip()
-        limit = _usage_limit(said, payload.get("api_error_status"))
+        limit = _usage_limit(said, payload.get("api_error_status"), redact=redact)
         if limit is not None:
             raise limit
-        # 要看的是 claude 最後說了什麼（result）；stream-json 的開頭是 init 事件（一長串工具清單），沒用
-        fallback = "" if redact else stdout[-1000:]
-        detail = (
-            f"Claude 回報錯誤：subtype={payload.get('subtype')}, "
-            f"api_error_status={payload.get('api_error_status')}\n{said[:1000] or fallback}"
-        )
+        head = (f"Claude 回報錯誤：subtype={payload.get('subtype')}, "
+                f"api_error_status={payload.get('api_error_status')}")
+        if redact:
+            detail = f"{head}（隔離模式不附 claude 的原始輸出）"
+        else:
+            # 要看的是 claude 最後說了什麼（result）；stream-json 的開頭是 init 事件（一長串工具清單），沒用
+            detail = f"{head}\n{said[:1000] or stdout[-1000:]}"
         # 401/403 是明確的認證失敗；其餘再用關鍵字啟發式判斷。
         if payload.get("api_error_status") in (401, 403) or _looks_like_auth_failure(
             stdout, stderr
