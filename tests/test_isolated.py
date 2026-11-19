@@ -110,25 +110,79 @@ def iso_dirs() -> set:
 
 
 class FakeRun:
-    """假的 subprocess.run：記下每次呼叫，並在「呼叫當下」記錄工作目錄的狀態。"""
+    """假的 claude 子程序（非串流 ask() 用）：記下每次呼叫，並在「呼叫當下」記錄工作目錄的狀態。
 
-    def __init__(self, stdout=None, returncode=0, stderr=""):
+    非隔離的 ask() 走 ``subprocess.run``（``fake.run``）；隔離的 ask() 走 ``subprocess.Popen``＋
+    ``communicate``（``fake.popen``）。兩條路的紀錄格式相同：``via`` 記走哪一條，``input`` 是 stdin 的內容。
+    pid 預設 None：測試永遠不會拿假的 pid 去叫真的 taskkill。"""
+
+    def __init__(self, stdout=None, returncode=0, stderr="", on_call=None, communicate_error=None, pid=None):
         self.calls = []
+        self.procs = []
         self.stdout = json.dumps(make_payload()) if stdout is None else stdout
         self.returncode = returncode
         self.stderr = stderr
+        self.on_call = on_call                      # 呼叫當下要做的事（例如在工作目錄留檔）
+        self.communicate_error = communicate_error  # communicate() 要丟的例外（逾時、Ctrl+C）
+        self.pid = pid
 
-    def __call__(self, cmd, **kwargs):
+    def _snapshot(self, cmd, kwargs, via):
         cwd = kwargs.get("cwd")
         snapshot = {
+            "via": via,
             "cmd": list(cmd),
             "kwargs": kwargs,
+            "input": kwargs.get("input"),
             "cwd_exists": bool(cwd) and os.path.isdir(cwd),
             "cwd_listing": os.listdir(cwd) if cwd and os.path.isdir(cwd) else None,
             "tmp_exists": os.path.isdir(kwargs["env"]["TEMP"]) if "TEMP" in (kwargs.get("env") or {}) else None,
         }
         self.calls.append(snapshot)
+        if self.on_call:
+            self.on_call(cmd, kwargs)
+        return snapshot
+
+    def run(self, cmd, **kwargs):
+        self._snapshot(cmd, kwargs, "run")
         return completed(self.stdout, self.stderr, self.returncode)
+
+    def popen(self, cmd, **kwargs):
+        proc = FakeCommProc(self, self._snapshot(cmd, kwargs, "popen"))
+        self.procs.append(proc)
+        return proc
+
+
+class FakeCommProc:
+    """FakeRun.popen 回傳的假 Popen 物件：支援 communicate／poll／wait／kill。"""
+
+    def __init__(self, owner: FakeRun, snapshot: dict):
+        self.owner = owner
+        self.snapshot = snapshot
+        self.pid = owner.pid
+        self.returncode = None
+        self.killed = False
+        self.waited = False
+        self.stdin, self.stdout, self.stderr = io.StringIO(), io.StringIO(), io.StringIO()
+
+    def communicate(self, input=None, timeout=None):
+        self.snapshot["input"] = input
+        self.snapshot["timeout"] = timeout
+        if self.owner.communicate_error is not None:
+            raise self.owner.communicate_error
+        self.returncode = self.owner.returncode
+        return self.owner.stdout, self.owner.stderr
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.waited = True
+        if self.returncode is None:
+            self.returncode = -9 if self.killed else self.owner.returncode
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
 
 
 class IsoCase(unittest.TestCase):
@@ -151,7 +205,8 @@ class IsoCase(unittest.TestCase):
 
     def run_ask(self, fake=None, **kwargs):
         fake = fake or FakeRun()
-        with mock.patch.object(cs.subprocess, "run", side_effect=fake):
+        with mock.patch.object(cs.subprocess, "run", side_effect=fake.run), \
+                mock.patch.object(cs.subprocess, "Popen", side_effect=fake.popen):
             result = cs.ask("秘密查詢 canary-query-42", **kwargs)
         return result, fake.calls[-1]
 
@@ -212,7 +267,7 @@ class TestIsolatedArgv(IsoCase):
 
     def test_query_goes_to_stdin_not_argv_or_env(self):
         _r, call = self.run_ask(isolated=True)
-        self.assertIn("canary-query-42", call["kwargs"]["input"])
+        self.assertIn("canary-query-42", call["input"])
         self.assertFalse(any("canary-query-42" in part for part in call["cmd"]))
         self.assertFalse(any("canary-query-42" in v for v in call["kwargs"]["env"].values()))
 
@@ -265,15 +320,19 @@ class TestIsolatedEnv(IsoCase):
         self.assertNotEqual(env["TEMP"], FAKE_ENV["TEMP"])
 
     def test_auth_auto_is_rejected(self):
-        with mock.patch.object(cs.subprocess, "run") as run, self.assertRaises(ValueError):
+        with mock.patch.object(cs.subprocess, "run") as run, \
+                mock.patch.object(cs.subprocess, "Popen") as popen, self.assertRaises(ValueError):
             cs.ask("q", isolated=True, auth="auto")
         run.assert_not_called()
+        popen.assert_not_called()
 
     def test_apikey_without_key_is_auth_error(self):
         os.environ.pop("ANTHROPIC_API_KEY")
-        with mock.patch.object(cs.subprocess, "run") as run, self.assertRaises(cs.ClaudeAuthError):
+        with mock.patch.object(cs.subprocess, "run") as run, \
+                mock.patch.object(cs.subprocess, "Popen") as popen, self.assertRaises(cs.ClaudeAuthError):
             cs.ask("q", isolated=True, auth="apikey")
         run.assert_not_called()
+        popen.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
@@ -305,15 +364,12 @@ class TestIsolatedWorkdir(IsoCase):
         self.assertEqual(iso_dirs(), before)
 
     def test_files_left_by_claude_are_removed_too(self):
-        def run(cmd, **kwargs):
+        def leave_files(cmd, kwargs):
             Path(kwargs["cwd"], "leftover.txt").write_text("x", encoding="utf-8")
             Path(kwargs["env"]["TEMP"], "cache.bin").write_bytes(b"x")
-            run.cwd = kwargs["cwd"]
-            return completed(json.dumps(make_payload()))
 
-        with mock.patch.object(cs.subprocess, "run", side_effect=run):
-            cs.ask("q", isolated=True)
-        self.assertFalse(os.path.exists(Path(run.cwd).parent))
+        _r, call = self.run_ask(FakeRun(on_call=leave_files), isolated=True)
+        self.assertFalse(os.path.exists(Path(call["kwargs"]["cwd"]).parent))
 
 
 # --------------------------------------------------------------------------- #
@@ -355,10 +411,11 @@ class TestIsolatedConflicts(IsoCase):
 class TestUnsupportedVersion(IsoCase):
     def _expect_unsupported(self, missing_flag, **kwargs):
         self.help_text = FAKE_HELP.replace(missing_flag, "--something-else")
-        with mock.patch.object(cs.subprocess, "run") as run:
+        with mock.patch.object(cs.subprocess, "run") as run, mock.patch.object(cs.subprocess, "Popen") as popen:
             with self.assertRaises(cs.ClaudeIsolationUnsupportedError) as ctx:
                 cs.ask("q", isolated=True, **kwargs)
         run.assert_not_called()
+        popen.assert_not_called()
         return ctx.exception
 
     def test_each_isolation_flag_is_required(self):
@@ -443,19 +500,20 @@ class TestClaudeHelpReader(unittest.TestCase):
 
     def test_full_isolated_call_reads_help_in_the_isolated_env(self):
         calls = []
+        fake = FakeRun()
 
         def run(cmd, **kwargs):
             calls.append((list(cmd), kwargs))
-            if cmd[-1] == "--help":
-                return completed(FAKE_HELP)
-            return completed(json.dumps(make_payload()))
+            return completed(FAKE_HELP)
 
         with mock.patch.object(cs, "find_claude_binary", return_value=FAKE_BINARY), \
                 mock.patch.dict(os.environ, FAKE_ENV, clear=True), \
-                mock.patch.object(cs.subprocess, "run", side_effect=run):
+                mock.patch.object(cs.subprocess, "run", side_effect=run), \
+                mock.patch.object(cs.subprocess, "Popen", side_effect=fake.popen):
             cs.ask("q", isolated=True)
-        self.assertEqual([c[0][-1] == "--help" for c in calls], [True, False])
-        help_kwargs, real_kwargs = calls[0][1], calls[1][1]
+        self.assertEqual([c[0][-1] for c in calls], ["--help"])      # --help 用 run 讀
+        self.assertEqual(len(fake.calls), 1)                          # 真正的呼叫走 Popen
+        help_kwargs, real_kwargs = calls[0][1], fake.calls[0]["kwargs"]
         self.assertNotIn("GITHUB_TOKEN", help_kwargs["env"])
         self.assertEqual(help_kwargs["cwd"], real_kwargs["cwd"])
 
@@ -668,9 +726,11 @@ class TestCliIsolated(IsoCase):
                          ["--isolated", "--continue", "q"], ["--isolated", "--tools", "Read", "q"],
                          ["--isolated", "--claude-arg=--add-dir", "q"]):
                 with self.subTest(argv=argv), mock.patch.object(cs.subprocess, "run") as run, \
+                        mock.patch.object(cs.subprocess, "Popen") as popen, \
                         redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
                     self.assertEqual(cs._main(argv), cs.EXIT_BAD_INPUT)
                     run.assert_not_called()
+                    popen.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
@@ -715,6 +775,92 @@ class TestStreamKillsChildOnAbort(IsoCase):
                 mock.patch.object(cs.subprocess, "run") as run:
             cs.ask_stream("q", lambda e: None, isolated=True, tools="WebSearch")
         self.assertFalse(FakePopen.instances[-1].killed)
+        run.assert_not_called()
+
+
+class TestNonStreamAskKillsTree(IsoCase):
+    """0.4.1：非串流 ask(isolated=True) 逾時或被中斷時，也要連 claude.cmd 底下的 node 一起殺掉，
+    等它結束，再刪暫存資料夾。非隔離的 ask() 照舊走 subprocess.run（行為不變）。"""
+
+    def _ask(self, fake, platform_name="win32", timeout=5):
+        with mock.patch.object(cs.sys, "platform", platform_name), \
+                mock.patch.object(cs.subprocess, "Popen", side_effect=fake.popen), \
+                mock.patch.object(cs.subprocess, "run") as run:
+            try:
+                cs.ask("q", isolated=True, timeout=timeout)
+            finally:
+                self.run_mock = run
+        return run
+
+    def test_isolated_uses_popen_and_non_isolated_still_uses_run(self):
+        _r, call = self.run_ask(isolated=True)
+        self.assertEqual(call["via"], "popen")
+        self.assertEqual(call["timeout"], 180)
+        _r, call = self.run_ask()
+        self.assertEqual(call["via"], "run")
+        # 非隔離：subprocess.run 的參數與 0.4.0 完全相同
+        expected = {"input", "capture_output", "text", "encoding", "errors", "env", "cwd", "timeout"}
+        self.assertEqual(set(call["kwargs"]) - {"creationflags"}, expected)
+        self.assertTrue(call["kwargs"]["capture_output"])
+        self.assertEqual(call["kwargs"]["timeout"], 180)
+
+    def test_timeout_kills_the_whole_tree_on_windows(self):
+        before = iso_dirs()
+        fake = FakeRun(communicate_error=subprocess.TimeoutExpired("claude", 5), pid=4242)
+        with self.assertRaises(cs.ClaudeError) as ctx:
+            self._ask(fake)
+        self.assertEqual(type(ctx.exception), cs.ClaudeError)
+        self.assertEqual(str(ctx.exception), "呼叫逾時（5s）。")
+        proc = fake.procs[-1]
+        self.assertEqual(proc.snapshot["timeout"], 5)
+        self.assertTrue(proc.killed)
+        self.assertTrue(proc.waited)
+        self.assertEqual(self.run_mock.call_args.args[0], ["taskkill", "/T", "/F", "/PID", "4242"])
+        self.assertFalse(os.path.exists(fake.calls[-1]["kwargs"]["cwd"]))
+        self.assertEqual(iso_dirs(), before)
+
+    def test_timeout_kills_child_on_other_platforms(self):
+        fake = FakeRun(communicate_error=subprocess.TimeoutExpired("claude", 5), pid=4242)
+        with self.assertRaises(cs.ClaudeError):
+            self._ask(fake, platform_name="linux")
+        self.assertTrue(fake.procs[-1].killed)
+        self.run_mock.assert_not_called()
+
+    def test_interrupt_kills_tree_and_is_reraised(self):
+        before = iso_dirs()
+        fake = FakeRun(communicate_error=KeyboardInterrupt(), pid=4242)
+        with self.assertRaises(KeyboardInterrupt):
+            self._ask(fake)
+        proc = fake.procs[-1]
+        self.assertTrue(proc.killed)
+        self.assertTrue(proc.waited)
+        self.assertEqual(self.run_mock.call_args.args[0], ["taskkill", "/T", "/F", "/PID", "4242"])
+        self.assertEqual(iso_dirs(), before)
+
+    def test_other_errors_while_waiting_also_kill(self):
+        fake = FakeRun(communicate_error=OSError("pipe broke"), pid=None)
+        with self.assertRaises(OSError):
+            self._ask(fake, platform_name="linux")
+        self.assertTrue(fake.procs[-1].killed)
+
+    def test_finished_child_is_not_killed(self):
+        fake = FakeRun(pid=4242)
+        self._ask(fake)
+        self.assertFalse(fake.procs[-1].killed)
+        self.run_mock.assert_not_called()
+
+    def test_none_pid_never_calls_taskkill(self):
+        fake = FakeRun(communicate_error=subprocess.TimeoutExpired("claude", 5), pid=None)
+        with self.assertRaises(cs.ClaudeError):
+            self._ask(fake, platform_name="win32")
+        self.assertTrue(fake.procs[-1].killed)
+        self.run_mock.assert_not_called()
+
+    def test_start_failure_is_still_not_found(self):
+        with mock.patch.object(cs.subprocess, "Popen", side_effect=OSError("gone")), \
+                mock.patch.object(cs.subprocess, "run") as run, \
+                self.assertRaises(cs.ClaudeNotFoundError):
+            cs.ask("q", isolated=True)
         run.assert_not_called()
 
 
@@ -780,10 +926,11 @@ class TestFlagDetectionUsesDeclarations(IsoCase):
     """旗標只算「選項宣告」那一行；只在別的旗標的說明裡被提到不算。"""
 
     def _expect_missing(self, missing):
-        with mock.patch.object(cs.subprocess, "run") as run, \
+        with mock.patch.object(cs.subprocess, "run") as run, mock.patch.object(cs.subprocess, "Popen") as popen, \
                 self.assertRaises(cs.ClaudeIsolationUnsupportedError) as ctx:
             cs.ask("q", isolated=True)
         run.assert_not_called()
+        popen.assert_not_called()
         self.assertEqual(ctx.exception.missing, missing)
 
     def test_flag_only_mentioned_in_another_description(self):
