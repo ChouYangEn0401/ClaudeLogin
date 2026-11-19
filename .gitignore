@@ -21,3 +21,7 @@ env/
 .idea/
 .DS_Store
 Thumbs.db
+
+# MVP inbox: work orders live here but are never committed (only the folder placeholder is)
+/_inbox/*
+!/_inbox/.gitkeep
