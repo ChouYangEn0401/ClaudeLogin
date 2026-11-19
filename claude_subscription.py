@@ -974,11 +974,12 @@ def _cited_links(text: str) -> list:
 
 
 def _pick_sources(text: str, hits: dict) -> list:
-    """來源：答案引用、且真的出現在搜尋結果裡的網址；答案沒引用就用全部搜尋結果。
-    讀不到搜尋結果（格式變了）時，退而用答案引用的網址。"""
-    cited = _cited_links(text)
+    """來源：答案引用、且真的出現在搜尋結果裡的網址。答案沒引用、或引用的全都對不上時，用全部搜尋結果
+    （都是驗證過的網址）。沒有任何搜尋結果（模型沒搜尋、或結果格式變了）時回空清單——
+    絕不把答案裡未驗證的網址當來源。"""
     if not hits:
-        return [{"title": title, "url": url} for _key, (title, url) in cited]
+        return []
+    cited = _cited_links(text)
     picked = [{"title": title or hits[key][0], "url": url} for key, (title, url) in cited if key in hits]
     if picked:
         return picked
@@ -1004,7 +1005,8 @@ def search(
     環境變數白名單。這版 claude 不支援需要的旗標時丟 ClaudeIsolationUnsupportedError。
     isolated=False：一樣只開 WebSearch、dontAsk，但沿用這台電腦的 Claude Code 設定（CLAUDE.md、MCP 等）。
 
-    sources 只收「答案引用、而且真的出現在 WebSearch 結果裡」的網址；答案沒引用就給全部搜尋結果。
+    sources 只收「答案引用、而且真的出現在 WebSearch 結果裡」的網址；答案沒引用（或引用的都對不上）
+    就給全部搜尋結果；沒有任何搜尋結果時是空清單（不收未驗證的網址）。
     on_event：想看進度就給（跟 ask_stream 一樣）；它丟的例外不會中斷搜尋。
     例外跟 ask() 相同；query 是空的丟 ValueError。
     """

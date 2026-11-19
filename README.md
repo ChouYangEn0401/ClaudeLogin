@@ -346,7 +346,8 @@ for s in r["sources"]:                               # [{"title": ..., "url": ..
 timeout=180, binary=None, auth="subscription", on_event=None) -> {"text": str, "sources": list}`
 
 - `sources` 只收「答案有引用、**而且真的出現在 WebSearch 結果裡**」的網址（擋掉模型自己編的網址）；
-  答案沒引用任何網址時，給全部搜尋結果；讀不到搜尋結果的格式時，退而用答案裡的網址。
+  答案沒引用任何網址、或引用的網址都對不上搜尋結果時，給全部搜尋結果（都是驗證過的網址）；
+  **沒有任何搜尋結果**（模型沒搜尋、或讀不到搜尋結果的格式）時，`sources` 是空清單，不收答案裡未驗證的網址。
 - `on_event` 可以拿來顯示進度（跟 `ask_stream` 一樣）。
 - `isolated=False`：一樣只開 WebSearch、`dontAsk`，但會沿用這台電腦的 Claude Code 設定。
 
