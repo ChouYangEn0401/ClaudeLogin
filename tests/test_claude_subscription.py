@@ -748,6 +748,7 @@ class FakePopen:
         self.returncode = None
         self._rc = returncode
         self.stderr = io.StringIO(err_text)
+        self.pid = None  # 假的子程序沒有 pid：不會拿去叫真的 taskkill
         FakePopen.instances.append(self)
 
     @property
@@ -757,6 +758,9 @@ class FakePopen:
             yield line
         while self._block and not self._killed:
             _t.sleep(0.01)
+
+    def poll(self):
+        return self.returncode
 
     def wait(self, timeout=None):
         self.returncode = -9 if self._killed else self._rc
