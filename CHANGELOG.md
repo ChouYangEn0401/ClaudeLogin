@@ -5,7 +5,10 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-19
+
 ### Fixed
+- 非串流 `ask(isolated=True)` 逾時或被中斷（含 Ctrl+C／`KeyboardInterrupt`）時，改成連子程序一起結束（Windows 用 `taskkill /T /F`，再補 `kill()`）、等它結束後才刪暫存資料夾。之前靠 `subprocess.run` 逾時只殺得到 npm `claude.cmd` 外層的 cmd.exe，node 會留下來，呼叫可能要等 node 自己結束才回來。一般模式（`isolated=False`）的 `ask()` 不受影響：仍用 `subprocess.run`，回傳、例外種類、錯誤訊息、結束碼都跟 0.4.0 相同。
 - `ask_stream()`／`search()` 讀到一半被中斷（Ctrl+C、`on_event` 丟 `BaseException`、讀取錯誤）時，claude 子程序會被結束，不再留在背景、讓隔離模式的暫存資料夾刪不掉；Windows 上逾時與中斷都用 `taskkill /T` 連子程序一起結束（npm 的 `claude.cmd`）。
 - 隔離模式的錯誤訊息不再附 claude 的 stderr、`result` 或 stdout 原文（之前子程序失敗、額度用完、錯誤 result 三條路都還會附）；錯誤類別不變。
 - 隔離模式的旗標檢查只認 `claude --help` 裡的選項宣告行；只在別的旗標說明裡被提到不再算有支援，`dontAsk` 要出現在 `--permission-mode` 的說明裡。
@@ -13,8 +16,9 @@
 - `search()` 的來源比對接受網址裡一層成對括號（例如維基百科 `/wiki/Foo_(bar)`），正確的引用不再被丟掉。
 
 ### Changed
-- （待擁有者確認）`search()` 沒有任何搜尋結果時 `sources` 回空清單，不再退回答案裡未驗證的網址。
-- README：補上 `--help` 讀取時間不算在 `timeout` 內、`CLAUDE_CONFIG_DIR` 不會傳給隔離模式、非串流 `ask()` 遇到 `claude.cmd` 時逾時的限制，以及「引用全對不上時給全部搜尋結果」的實際行為。
+- **行為改變**：`search()` 在**沒有任何搜尋結果**時（模型沒搜尋、或讀不到搜尋結果的格式），`sources` 回空清單 `[]`，不再退回答案裡未驗證的網址。對呼叫端的影響：這種情況下以前可能拿到幾個來源、現在拿到 `[]`；`sources` 的型別不變，但呼叫端不能假設它一定不是空的（顯示「沒有來源」或改看 `text`）。有搜尋結果時的行為不變（只收引用且出現在結果裡的網址；全都對不上就給全部搜尋結果）。
+- 隔離模式不放行 `CLAUDE_CONFIG_DIR`（刻意維持 0.4.0 的白名單）；README 寫明這種情況要改用 `CLAUDE_CODE_OAUTH_TOKEN`（`claude setup-token` 取得）。
+- README：補上 `--help` 讀取時間不算在 `timeout` 內、`CLAUDE_CONFIG_DIR` 的處理方式、隔離模式三個呼叫的中斷與逾時都會殺整棵程序樹，以及「引用全對不上時給全部搜尋結果」的實際行為；安裝範例的版本改成 0.4.1。
 
 ## [0.4.0] - 2026-11-18
 

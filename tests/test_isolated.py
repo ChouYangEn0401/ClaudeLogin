@@ -664,7 +664,7 @@ class TestSearch(StreamCase):
         self.assertEqual(out["sources"][0]["title"], "Python 3.13 release notes")
 
     def test_unknown_result_format_gives_no_sources(self):
-        """（待擁有者確認的語意）讀不到搜尋結果時回空清單，不回答案裡未驗證的網址。"""
+        """讀不到搜尋結果時回空清單，不回答案裡未驗證的網址。"""
         out, _ = self.run_search("見 https://example.org/a.", links="(no links)")
         self.assertEqual(out["sources"], [])
 
@@ -1012,7 +1012,7 @@ class TestSourcesReview(StreamCase):
             "https://docs.python.org/3/whatsnew/3.13.html", "https://www.python.org/downloads/"])
 
     def test_no_search_results_means_no_sources(self):
-        """（待擁有者確認的語意）沒有任何搜尋結果時，不把答案裡未驗證的網址當來源。"""
+        """沒有任何搜尋結果時，不把答案裡未驗證的網址當來源。"""
         FakePopen.instances = []
         lines = stream_without_search("見 [官方](https://made-up.example/page)。")
         with mock.patch.object(cs.subprocess, "Popen", side_effect=lambda cmd, **kw: FakePopen(cmd, lines, **kw)):

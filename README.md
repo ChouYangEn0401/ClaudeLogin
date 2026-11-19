@@ -101,7 +101,7 @@ python claude_subscription.py --format json "分類情緒：這服務爛透了"
 
 **③ 想要「一個指令」→ `pip install` 或用啟動器**
 ```bash
-pip install claude_subscription-0.4.0-py3-none-any.whl
+pip install claude_subscription-0.4.1-py3-none-any.whl
 claude-sub "你的提示"
 ```
 
@@ -190,7 +190,7 @@ claude-sub --check --no-ping    # 只做靜態檢查，完全不花錢（適合 
 
 **第 4 步：讓它「隨處可用」（三選一）**
 
-1. **pip 安裝（最推薦）**：`pip install claude_subscription-0.4.0-py3-none-any.whl`，
+1. **pip 安裝（最推薦）**：`pip install claude_subscription-0.4.1-py3-none-any.whl`，
    得到全域指令 `claude-sub`。跨平台指令名一致，不用改 PATH。
 2. **啟動器腳本**：把本資料夾加入系統 PATH。**注意 wheel 裡不含這兩個檔**，
    要用得從原始碼資料夾拿：
@@ -383,9 +383,10 @@ CLI `claude-sub --isolated [--tools WebSearch] "……"`。
 **錯誤訊息**：隔離模式的例外只寫結束碼或 `subtype`／`api_error_status`，不附 claude 的 stderr、
 `result` 或 stdout 原文；錯誤類別照常分（`ClaudeAuthError`、`ClaudeUsageLimitError`，重置時間在 `.resets`）。
 
-**中斷與逾時**：`ask_stream()`／`search()` 讀到一半被中斷（Ctrl+C、`on_event` 丟出 `KeyboardInterrupt` 等）
-或逾時時，會先結束 claude 子程序再刪暫存資料夾；Windows 上用 `taskkill /T` 連子程序一起結束
-（npm 裝的 `claude.cmd` 是 cmd.exe 包著 node）。
+**中斷與逾時**：隔離模式的 `ask()`、`ask_stream()`、`search()` 跑到一半被中斷（Ctrl+C、`on_event` 丟出
+`KeyboardInterrupt` 等）或逾時時，會先結束 claude 子程序、等它結束，再刪暫存資料夾；Windows 上用 `taskkill /T`
+連子程序一起結束（npm 裝的 `claude.cmd` 是 cmd.exe 包著 node）。非串流 `ask(isolated=True)` 從 v0.4.1 起也是這樣。
+一般模式（`isolated=False`）的 `ask()` 行為不變，仍用 Python 的 `subprocess.run` 處理逾時。
 
 **限制（請知道）**
 
@@ -397,11 +398,11 @@ CLI `claude-sub --isolated [--tools WebSearch] "……"`。
 - `auth="apikey"` 只傳 `ANTHROPIC_API_KEY`／`ANTHROPIC_BASE_URL`；Bedrock／Vertex／Foundry 需要的雲端憑證不會傳，隔離模式不支援這些供應商。
 - 公司網路要走 proxy 的話，`HTTPS_PROXY` 等變數會照傳（連網必要）；proxy 網址裡若含帳密，也會一起傳給子程序。
 - 隔離模式用到的旗標（`--safe-mode`、`--restricted` 等）是 Claude Code 較新版才有的；舊版會直接報錯。
-- 用 `CLAUDE_CONFIG_DIR` 把 Claude Code 的設定／登入放在別的資料夾的話：隔離模式**不會**傳這個變數，
-  claude 會回去找家目錄底下的預設位置，通常會得到 `ClaudeAuthError`（沒登入），或用到預設位置裡的另一組登入。
-  訂閱登入可以改用 `CLAUDE_CODE_OAUTH_TOKEN`（`claude setup-token` 取得）。
-- `ask(..., isolated=True)`（非串流）逾時時，靠 Python 的 `subprocess.run` 結束子程序；若 claude 是 npm 的
-  `claude.cmd`，只結束得到外層 cmd.exe，可能要等 node 自己結束才回來。要確定逾時能殺乾淨，請用 `ask_stream()`／`search()`。
+- 用 `CLAUDE_CONFIG_DIR` 把 Claude Code 的設定／登入放在別的資料夾的話：隔離模式**不會**傳這個變數（刻意的：
+  環境變數是白名單，只傳登入需要的那一個憑證，不傳指向設定資料夾的路徑），claude 會回去找家目錄底下的預設位置，通常會得到
+  `ClaudeAuthError`（沒登入），或用到預設位置裡的另一組登入。
+  **這種情況請改用 `CLAUDE_CODE_OAUTH_TOKEN`**：執行 `claude setup-token` 取得 token，設成呼叫端的環境變數；
+  隔離模式只會把這一個憑證傳給 claude。
 
 ---
 
@@ -569,7 +570,7 @@ agent 參數透傳、`check_setup` 的所有分支，以及隔離模式與 `sear
 python -m venv .venv
 ./.venv/Scripts/python -m pip install build      # macOS/Linux: ./.venv/bin/python
 ./.venv/Scripts/python -m build --wheel
-# -> dist/claude_subscription-0.4.0-py3-none-any.whl
+# -> dist/claude_subscription-0.4.1-py3-none-any.whl
 ```
 
 產出的 wheel 是 `py3-none-any`（純 Python、跨平台通用），**零相依**，內容只有
