@@ -384,13 +384,18 @@ _LIMIT_RE = re.compile(r"(?i)(hit your (?:\w+ )?limit|usage limit|limit (?:reach
 _RESETS_RE = re.compile(r"(?i)resets?\s*(?:at\s*)?([^·\n.;]{1,40})")
 
 
-def _usage_limit(text: str, status=None):
-    """是額度用完就回 ClaudeUsageLimitError，不是回 None。"""
+def _usage_limit(text: str, status=None, *, redact: bool = False):
+    """是額度用完就回 ClaudeUsageLimitError，不是回 None。
+
+    redact=True（隔離模式）：訊息不引用 claude 的原文，重置時間只放在 ``.resets``。"""
     text = " ".join(str(text or "").split())
     if status != 429 and not _LIMIT_RE.search(text):
         return None
     match = _RESETS_RE.search(text)
     resets = match.group(1).strip() if match else ""
+    if redact:
+        return ClaudeUsageLimitError(
+            "Claude 的使用額度用完了（隔離模式不附 claude 的原始輸出；重置時間見 .resets）。", resets=resets)
     shown = text[:200] if text else "HTTP 429"
     return ClaudeUsageLimitError(f"Claude 的使用額度用完了：{shown}", resets=resets)
 
@@ -528,7 +533,7 @@ def _run_json(claude, cmd, env, prompt, cwd, timeout, *, redact: bool) -> Claude
         raise ClaudeNotFoundError(f"無法執行 {claude}：{e}\n\n{_install_hint()}") from e
 
     if proc.returncode != 0:
-        _raise_process_failure(proc.returncode, proc.stderr, proc.stdout)
+        _raise_process_failure(proc.returncode, proc.stderr, proc.stdout, redact=redact)
 
     try:
         payload = json.loads(proc.stdout)
@@ -654,7 +659,7 @@ def _run_stream(claude, cmd, env, prompt, cwd, timeout, on_event, *, redact: boo
         raise ClaudeError(f"呼叫逾時（{timeout}s）。")
     if final is None:
         if proc.returncode != 0:
-            _raise_process_failure(proc.returncode, stderr, stdout)
+            _raise_process_failure(proc.returncode, stderr, stdout, redact=redact)
         shown = "（隔離模式不附原始輸出）" if redact else f"\nstdout:\n{stdout[-2000:]}"
         raise ClaudeError(f"claude 沒有送出 result 事件。{shown}")
     return _result_from(final, stdout, stderr, redact=redact)
@@ -1001,11 +1006,15 @@ def _no_window_kwargs() -> dict:
     return {}
 
 
-def _raise_process_failure(returncode: int, stderr: str, stdout: str):
-    detail = f"claude 子程序失敗 (exit {returncode}).\nstderr:\n{(stderr or '').strip()}"
+def _raise_process_failure(returncode: int, stderr: str, stdout: str, *, redact: bool = False):
+    """子程序非 0 結束 → 對應的例外。redact=True（隔離模式）：只說結束碼與錯誤類別，不附 stderr 原文。"""
+    if redact:
+        detail = f"claude 子程序失敗 (exit {returncode})。（隔離模式不附 claude 的原始輸出）"
+    else:
+        detail = f"claude 子程序失敗 (exit {returncode}).\nstderr:\n{(stderr or '').strip()}"
     if _looks_like_auth_failure(stderr, stdout):
         raise ClaudeAuthError(detail)
-    limit = _usage_limit(f"{stderr or ''} {(stdout or '')[-2000:]}")
+    limit = _usage_limit(f"{stderr or ''} {(stdout or '')[-2000:]}", redact=redact)
     if limit is not None:
         raise limit
     raise ClaudeError(detail)
@@ -1014,18 +1023,20 @@ def _raise_process_failure(returncode: int, stderr: str, stdout: str):
 def _result_from(payload: dict, stdout: str, stderr: str, *, redact: bool = False) -> ClaudeResult:
     """claude 的 result JSON（json 模式整包、stream-json 模式最後一個事件）→ ClaudeResult，或丟出對應的例外。
 
-    redact=True（隔離模式）：錯誤訊息只附 claude 的錯誤說明，不附 stdout 原文（可能帶到查詢內容）。"""
+    redact=True（隔離模式）：錯誤訊息只有 subtype 與 api_error_status，不附 result 與 stdout 原文
+    （result 可能是模型的部分回答、或重述了查詢）。"""
     if payload.get("is_error") or payload.get("subtype") != "success":
         said = str(payload.get("result") or "").strip()
-        limit = _usage_limit(said, payload.get("api_error_status"))
+        limit = _usage_limit(said, payload.get("api_error_status"), redact=redact)
         if limit is not None:
             raise limit
-        # 要看的是 claude 最後說了什麼（result）；stream-json 的開頭是 init 事件（一長串工具清單），沒用
-        fallback = "" if redact else stdout[-1000:]
-        detail = (
-            f"Claude 回報錯誤：subtype={payload.get('subtype')}, "
-            f"api_error_status={payload.get('api_error_status')}\n{said[:1000] or fallback}"
-        )
+        head = (f"Claude 回報錯誤：subtype={payload.get('subtype')}, "
+                f"api_error_status={payload.get('api_error_status')}")
+        if redact:
+            detail = f"{head}（隔離模式不附 claude 的原始輸出）"
+        else:
+            # 要看的是 claude 最後說了什麼（result）；stream-json 的開頭是 init 事件（一長串工具清單），沒用
+            detail = f"{head}\n{said[:1000] or stdout[-1000:]}"
         # 401/403 是明確的認證失敗；其餘再用關鍵字啟發式判斷。
         if payload.get("api_error_status") in (401, 403) or _looks_like_auth_failure(
             stdout, stderr
