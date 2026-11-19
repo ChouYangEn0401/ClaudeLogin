@@ -75,7 +75,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "ask",
@@ -509,38 +509,87 @@ def ask(
             max_budget_usd=max_budget_usd, tools=tools, permission_mode=permission_mode, binary=binary,
             auth=auth, attach=attach, resume=resume, session_id=session_id, persist=persist,
             cwd=cwd, extra_args=extra_args, isolated=isolated, tmp_root=tmp_root)
-        return _run_json(claude, cmd, env, prompt, run_cwd, timeout, redact=isolated)
+        return _run_json(claude, cmd, env, prompt, run_cwd, timeout, redact=isolated, kill_tree=isolated)
 
 
-def _run_json(claude, cmd, env, prompt, cwd, timeout, *, redact: bool) -> ClaudeResult:
-    """ask() 的子程序部分：一次跑完、讀整包 JSON。redact=True 時錯誤訊息不附 claude 的原始輸出。"""
+def _run_json(claude, cmd, env, prompt, cwd, timeout, *, redact: bool, kill_tree: bool = False) -> ClaudeResult:
+    """ask() 的子程序部分：一次跑完、讀整包 JSON。redact=True 時錯誤訊息不附 claude 的原始輸出。
+
+    kill_tree=True（隔離模式）時改用 Popen：逾時或被中斷都用 _kill_tree 連子程序一起結束、等它結束，
+    之後暫存資料夾才刪得掉。kill_tree=False（一般模式）照舊用 subprocess.run，行為與 0.4.0 相同。"""
+    if kill_tree:
+        returncode, stdout, stderr = _communicate_killing_tree(claude, cmd, env, prompt, cwd, timeout)
+    else:
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",  # claude 若吐出非 UTF-8 位元組，不要蓋掉真正的錯誤原因
+                env=env,
+                cwd=cwd,
+                timeout=timeout,
+                **_no_window_kwargs(),
+            )
+        except subprocess.TimeoutExpired as e:
+            raise ClaudeError(f"呼叫逾時（{timeout}s）。") from e
+        except OSError as e:  # 執行檔在解析後又消失、或路徑不可執行
+            raise ClaudeNotFoundError(f"無法執行 {claude}：{e}\n\n{_install_hint()}") from e
+        returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+
+    if returncode != 0:
+        _raise_process_failure(returncode, stderr, stdout, redact=redact)
+
     try:
-        proc = subprocess.run(
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        shown = "（隔離模式不附原始輸出）" if redact else f"\nstdout:\n{stdout[:2000]}"
+        raise ClaudeError(f"無法解析 claude 的 JSON 輸出。{shown}") from e
+    return _result_from(payload, stdout, stderr, redact=redact)
+
+
+def _communicate_killing_tree(claude, cmd, env, prompt, cwd, timeout) -> tuple:
+    """跟 subprocess.run(input=…, capture_output=True, timeout=…) 一樣跑完並收齊輸出，回傳 (returncode, stdout, stderr)。
+
+    不同處：逾時或任何例外（含 KeyboardInterrupt）時用 _kill_tree 結束整棵程序樹。subprocess.run 逾時只
+    ``kill()`` 得到 npm ``claude.cmd`` 外層的 cmd.exe，node 還握著輸出管線，之後收輸出會一直等。"""
+    try:
+        proc = subprocess.Popen(
             cmd,
-            input=prompt,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
-            errors="replace",  # claude 若吐出非 UTF-8 位元組，不要蓋掉真正的錯誤原因
+            errors="replace",
             env=env,
             cwd=cwd,
-            timeout=timeout,
             **_no_window_kwargs(),
         )
-    except subprocess.TimeoutExpired as e:
-        raise ClaudeError(f"呼叫逾時（{timeout}s）。") from e
     except OSError as e:  # 執行檔在解析後又消失、或路徑不可執行
         raise ClaudeNotFoundError(f"無法執行 {claude}：{e}\n\n{_install_hint()}") from e
-
-    if proc.returncode != 0:
-        _raise_process_failure(proc.returncode, proc.stderr, proc.stdout, redact=redact)
-
     try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError as e:
-        shown = "（隔離模式不附原始輸出）" if redact else f"\nstdout:\n{proc.stdout[:2000]}"
-        raise ClaudeError(f"無法解析 claude 的 JSON 輸出。{shown}") from e
-    return _result_from(payload, proc.stdout, proc.stderr, redact=redact)
+        stdout, stderr = proc.communicate(prompt, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        _stop_tree(proc)
+        raise ClaudeError(f"呼叫逾時（{timeout}s）。") from e
+    except BaseException:
+        _stop_tree(proc)
+        raise
+    return proc.returncode, stdout or "", stderr or ""
+
+
+def _stop_tree(proc) -> None:
+    """結束整棵程序樹並等它結束（最多 5 秒）；不丟例外，好讓呼叫端照原本的例外往上拋。
+
+    不主動 close stdout／stderr：Windows 上 communicate 的讀取執行緒可能還卡在 read，這時 close
+    會等同一把鎖而卡住；程序樹結束後管線自然收到 EOF，讀取執行緒（daemon）就會結束。"""
+    with contextlib.suppress(Exception):
+        _kill_tree(proc)
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=5)
 
 
 def ask_stream(

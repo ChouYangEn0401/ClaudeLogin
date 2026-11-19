@@ -25,10 +25,12 @@
 | 15 | 跑 `claude --help`，對照 `_isolation_flags()` 的每個旗標與 `--permission-mode` 的 choices | 每個旗標都有**自己的宣告行**（不是只出現在別的旗標說明裡）；`dontAsk` 在 `--permission-mode` 那一條裡。把 `claude --version` 記在結果欄 | ☐ |
 | 16 | `search("寫一篇很長的介紹", timeout=600)` 跑到一半在終端機按 Ctrl+C；接著用工作管理員或 `Get-CimInstance Win32_Process` 找 claude／node 程序，並看系統暫存資料夾 | 沒有殘留的 claude／node 子程序；沒有殘留的 `claude-iso-*` 資料夾 | ☐ |
 | 17 | 用 npm 裝的 `claude.cmd`（`binary=` 指向它）跑 `ask_stream(..., isolated=True, timeout=5)`，提示要它寫長文 | 約 5 秒後丟「呼叫逾時」；沒有殘留的 node 程序；`claude-iso-*` 已刪 | ☐ |
-| 18 | 同上，但用 `ask(..., isolated=True, timeout=5)`（非串流） | 記錄實際花多久才回來、有沒有殘留 node 程序（README 已註明這條路對 `claude.cmd` 可能要等 node 自己結束；若殘留，回報給擁有者決定要不要改） | ☐ |
+| 18 | 同上，但用 `ask(..., isolated=True, timeout=5)`（非串流；0.4.1 起也會殺整棵） | 約 5 秒（最多再加幾秒等程序結束）後丟「呼叫逾時（5s）。」；整棵被殺、沒有殘留的 claude／node 程序；`claude-iso-*` 已刪。記下實際花了幾秒 | ☐ |
 | 19 | 設 `CLAUDE_CONFIG_DIR` 指向一個有登入的設定資料夾、家目錄預設位置**沒有**登入，跑 `ask("說 OK", isolated=True)` | 預期得到 `ClaudeAuthError`（隔離模式不傳這個變數）；記錄實際結果。改設 `CLAUDE_CODE_OAUTH_TOKEN` 再跑一次應該成功 | ☐ |
 | 20 | 隔離呼叫故意觸發錯誤（例如 `max_budget_usd=0.000001`），提示裡放一個暗號 | 例外訊息與終端輸出不含暗號、不含 claude 的回答片段，只有結束碼或 subtype／api_error_status | ☐ |
 | 21 | `ask("說 OK", isolated=True, model="--help")` | 立刻 `ValueError`，沒有啟動 claude | ☐ |
+| 22 | 用 npm 的 `claude.cmd` 跑 `ask("寫一篇很長的介紹", isolated=True, timeout=600)`（非串流），跑到一半在終端機按 Ctrl+C | 立刻（幾秒內）回到 `KeyboardInterrupt`；沒有殘留的 claude／node 程序；`claude-iso-*` 已刪 | ☐ |
+| 23 | `search("1 加 1 等於多少？不用上網查，直接回答，並在答案裡附上 https://example.com")` | 模型沒搜尋時 `sources` 是空清單 `[]`（不收答案裡未驗證的網址）；若模型還是搜尋了，記下來、改用別的題目再試 | ☐ |
 
 限制（不是 bug）：隔離模式不是作業系統層級的沙箱，claude 仍然讀得到家目錄（訂閱登入憑證放在那裡）。
 
