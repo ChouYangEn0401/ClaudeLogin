@@ -930,8 +930,9 @@ _SEARCH_SYSTEM = (
     "用提問的語言回答。最後一段寫「來源：」，每行一個 markdown 連結 [標題](網址)，"
     "只列搜尋結果裡真的出現過的網址。"
 )
-_MD_LINK_RE = re.compile(r"\[([^\]\n]{1,300})\]\((https?://[^\s)]+)\)")
-_BARE_URL_RE = re.compile(r"https?://[^\s<>\"'\)\]]+")
+# 網址裡允許一層成對括號（例如維基百科的 /wiki/Foo_(bar)），不成對的右括號當作網址結束。
+_MD_LINK_RE = re.compile(r"\[([^\]\n]{1,300})\]\((https?://(?:[^\s()]|\([^\s()]*\))+)\)")
+_BARE_URL_RE = re.compile(r"https?://(?:[^\s<>\"'()\]]|\([^\s<>\"'()\]]*\))+")
 _HIT_RE = re.compile(
     r'"title"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"url"\s*:\s*"(https?://(?:[^"\\]|\\.)*)"')
 
