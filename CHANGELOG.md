@@ -5,6 +5,17 @@
 
 ## [Unreleased]
 
+### Fixed
+- `ask_stream()`／`search()` 讀到一半被中斷（Ctrl+C、`on_event` 丟 `BaseException`、讀取錯誤）時，claude 子程序會被結束，不再留在背景、讓隔離模式的暫存資料夾刪不掉；Windows 上逾時與中斷都用 `taskkill /T` 連子程序一起結束（npm 的 `claude.cmd`）。
+- 隔離模式的錯誤訊息不再附 claude 的 stderr、`result` 或 stdout 原文（之前子程序失敗、額度用完、錯誤 result 三條路都還會附）；錯誤類別不變。
+- 隔離模式的旗標檢查只認 `claude --help` 裡的選項宣告行；只在別的旗標說明裡被提到不再算有支援，`dontAsk` 要出現在 `--permission-mode` 的說明裡。
+- 隔離模式拒絕以 `-` 開頭的 `model`／`system`（`ValueError`），避免被 claude 當成另一個旗標。
+- `search()` 的來源比對接受網址裡一層成對括號（例如維基百科 `/wiki/Foo_(bar)`），正確的引用不再被丟掉。
+
+### Changed
+- （待擁有者確認）`search()` 沒有任何搜尋結果時 `sources` 回空清單，不再退回答案裡未驗證的網址。
+- README：補上 `--help` 讀取時間不算在 `timeout` 內、`CLAUDE_CONFIG_DIR` 不會傳給隔離模式、非串流 `ask()` 遇到 `claude.cmd` 時逾時的限制，以及「引用全對不上時給全部搜尋結果」的實際行為。
+
 ## [0.4.0] - 2026-11-18
 
 ### Added
