@@ -101,7 +101,7 @@ python claude_subscription.py --format json "分類情緒：這服務爛透了"
 
 **③ 想要「一個指令」→ `pip install` 或用啟動器**
 ```bash
-pip install claude_subscription-0.4.1-py3-none-any.whl
+pip install claude_subscription-0.5.0-py3-none-any.whl
 claude-sub "你的提示"
 ```
 
@@ -120,6 +120,55 @@ claude-sub "你的提示"
 | `4` | 參數或輸入檔錯誤（附檔不存在、schema 壞掉、旗標打錯） | 呼叫端的 bug |
 
 `2` 和 `3` 是「對方的環境要處理」，`1` 是「可以重試」，`4` 是「你的程式有 bug」。
+
+---
+
+## 🔌 給程式呼叫：統一介面（v0.5.0）
+
+`claude_subscription`、`github_copilot_login`、`chatgpt_login` 三個訂閱登入套件用**同一組名字**，
+包裝它們的程式（例如多來源的 LLM 函式庫）可以用同一段程式碼接三家。介面版本 `INTERFACE_VERSION = "1"`。
+
+```python
+from claude_subscription import ask, LoginError, UsageLimitError, AuthError, NotInstalledError, CallTimeoutError
+
+messages = [{"role": "system", "content": "回答要短"},
+            {"role": "user", "content": "一句話介紹台北"}]
+try:
+    r = ask(messages, model=None, timeout=120)   # 第一個參數可以是字串，也可以是訊息清單
+    print(r.text, r.model, r.usage)              # usage: {"input", "output", "cached_input"}
+except UsageLimitError as e:                     # 額度用完：e.resets（重置時間原文）、e.retry_after（秒或 None）
+    ...
+except AuthError:                                # 沒登入／登入過期
+    ...
+except NotInstalledError:                        # 找不到 claude 執行檔
+    ...
+except CallTimeoutError:                         # 逾時
+    ...
+except LoginError as e:                          # 其他叫不動的情況；e.kind 是分類字串
+    ...
+```
+
+| 名字 | 在這個套件裡 | 說明 |
+|---|---|---|
+| `ask(prompt, *, model=None, system=…, timeout=180, **opts)` | 就是原本的 `ask()` | `prompt` 可以是字串或訊息清單；`model=None`＝`haiku`；其他參數（`json_schema`、`isolated`…）照舊 |
+| `Result` | `ClaudeResult` 的別名 | `.text`、`.usage`（新）、`.model`（新）、`.raw`；Claude 專屬的 `.cost_usd`、`.session_id` 照舊 |
+| `LoginError` | 新的共同基底 | 下面每一種錯誤都是它；`.kind` 是分類字串 |
+| `UsageLimitError` | `ClaudeUsageLimitError` 的別名 | `kind="quota_exhausted"`；`.resets`、`.retry_after`（Claude 只給時刻，所以是 `None`） |
+| `AuthError` | `ClaudeAuthError` 的別名 | `kind="auth_invalid"` |
+| `NotInstalledError` | `ClaudeNotFoundError` 的別名 | `kind="not_installed"`；仍是 `FileNotFoundError`、**不是** `ClaudeError` |
+| `CallTimeoutError` | `ClaudeTimeoutError` 的別名 | `kind="timeout"`；是 `ClaudeError` 的子類別 |
+| `CAPABILITIES` | dict | 能力照實標：`tools=False`（沒有 function calling）、`images=False`、`stream=True`（`ask_stream`）、`messages="flattened"` |
+| `flatten_messages(messages, system=None)` | 函式 | 訊息清單 → `(system, prompt)`；三個套件寫法一樣 |
+
+訊息清單的規則：
+- 每則是 dict（`role`、`content`）或有 `.role`／`.content` 的物件；`content` 可以是字串或 OpenAI 式 parts（只收文字）。
+- `system` 那幾則併進系統提示（`ask` 有明確給 `system=` 字串時，訊息裡的接在後面）。
+- 只有一則 `user`：原文照送。多輪：攤成一段逐字稿送出（`claude -p` 一次只收一段，**不會**接上 claude 自己的 session）。
+- `tool` 角色、圖片、最後一則不是 `user` → `ValueError`（這條路沒有工具呼叫，也不收圖）。
+
+舊的名字（`ClaudeError`、`ClaudeAuthError`、`ClaudeNotFoundError`、`ClaudeUsageLimitError`…）全部保留，
+`except` 的行為不變；唯一的差別是逾時現在丟 `ClaudeTimeoutError`（`ClaudeError` 的子類別），
+用 `type(e) is ClaudeError` 精確比對型別的程式要改成 `isinstance`。
 
 ---
 
@@ -190,7 +239,7 @@ claude-sub --check --no-ping    # 只做靜態檢查，完全不花錢（適合 
 
 **第 4 步：讓它「隨處可用」（三選一）**
 
-1. **pip 安裝（最推薦）**：`pip install claude_subscription-0.4.1-py3-none-any.whl`，
+1. **pip 安裝（最推薦）**：`pip install claude_subscription-0.5.0-py3-none-any.whl`，
    得到全域指令 `claude-sub`。跨平台指令名一致，不用改 PATH。
 2. **啟動器腳本**：把本資料夾加入系統 PATH。**注意 wheel 裡不含這兩個檔**，
    要用得從原始碼資料夾拿：
@@ -262,8 +311,8 @@ timeout, binary, auth, attach, resume, session_id, persist, cwd, extra_args, iso
 
 | 參數 | 預設 | 說明 |
 |------|------|------|
-| `prompt` | （必填） | 提示 / 要處理的資料字串 |
-| `model` | `"haiku"` | `haiku`(最便宜) / `sonnet`(均衡) / `opus`(最強最貴) 或完整模型名 |
+| `prompt` | （必填） | 提示 / 要處理的資料字串；v0.5.0 起也可以是訊息清單（見「🔌 給程式呼叫」） |
+| `model` | `None`（＝`"haiku"`） | `haiku`(最便宜) / `sonnet`(均衡) / `opus`(最強最貴) 或完整模型名 |
 | `system` | 內建精簡提示 | 系統提示；設 `None` 用 Claude Code 預設（**較貴**）。延續對話時自動略過。**覆寫會讓 Claude 不知道自己在哪個資料夾** |
 | `json_schema` | `None` | 給定後強制結構化輸出，用 `r.data` 取得 |
 | `max_budget_usd` | `None` | 單次花費上限，超過中止，保護額度 |
@@ -290,15 +339,19 @@ timeout, binary, auth, attach, resume, session_id, persist, cwd, extra_args, iso
 | `.cost_usd` | 本次花費（從額度/餘額扣） |
 | `.session_id` | 本次 session id（傳給下次 `resume` 即可延續） |
 | `.num_turns` / `.duration_ms` / `.raw` | 輪數 / 耗時 / 完整原始 JSON |
+| `.usage` | 統一格式的 token 用量 `{"input", "output", "cached_input"}`（v0.5.0） |
+| `.model` | 實際用的模型（取自 `modelUsage`；取不到就是呼叫時要的那個，v0.5.0） |
 
 例外階層（對應結束碼）：
 
 | 例外 | 意思 | 結束碼 |
 |------|------|------|
-| `ClaudeNotFoundError`（繼承 `FileNotFoundError`） | 找不到 claude 執行檔 | 2 |
+| `ClaudeNotFoundError`（繼承 `FileNotFoundError`、`LoginError`；**不是** `ClaudeError`） | 找不到 claude 執行檔 | 2 |
 | `ClaudeAuthError`（繼承 `ClaudeError`） | 沒登入 / token 過期 / API key 無效 | 3 |
+| `ClaudeUsageLimitError`（繼承 `ClaudeError`） | 訂閱額度用完（`.resets` 是重置時間原文） | 1 |
+| `ClaudeTimeoutError`（繼承 `ClaudeError`，v0.5.0） | 逾時 | 1 |
 | `ClaudeIsolationUnsupportedError`（繼承 `ClaudeError`） | 隔離模式需要的旗標，這版 claude 沒有（`.missing` 列出缺哪些） | 1 |
-| `ClaudeError` | 其他呼叫失敗 | 1 |
+| `ClaudeError`（繼承 `RuntimeError`、`LoginError`） | 其他呼叫失敗 | 1 |
 | `FileNotFoundError` / `ValueError` | 附檔不存在、附檔非文字、參數不合法 | 4 |
 
 ### `ask_stream()`：邊跑邊看到事件（v0.3.0）
@@ -537,7 +590,7 @@ console.log(r2.text);       // -> A-12345
 python -m unittest discover -s tests -v
 ```
 
-144 個測試，涵蓋命令列組裝、auth 環境變數清理、失敗分類、結束碼契約、輸出格式、
+195 個測試，涵蓋命令列組裝、auth 環境變數清理、失敗分類、結束碼契約、輸出格式、
 agent 參數透傳、`check_setup` 的所有分支，以及隔離模式與 `search()`
 （`tests/test_isolated.py`：用假子程序與假的 `claude --help` 驗證每一條隔離承諾）。
 用標準庫 `unittest`，不需要裝 pytest（維持零相依）。
@@ -570,7 +623,7 @@ agent 參數透傳、`check_setup` 的所有分支，以及隔離模式與 `sear
 python -m venv .venv
 ./.venv/Scripts/python -m pip install build      # macOS/Linux: ./.venv/bin/python
 ./.venv/Scripts/python -m build --wheel
-# -> dist/claude_subscription-0.4.1-py3-none-any.whl
+# -> dist/claude_subscription-0.5.0-py3-none-any.whl
 ```
 
 產出的 wheel 是 `py3-none-any`（純 Python、跨平台通用），**零相依**，內容只有
