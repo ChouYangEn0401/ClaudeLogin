@@ -809,7 +809,8 @@ class TestNonStreamAskKillsTree(IsoCase):
         fake = FakeRun(communicate_error=subprocess.TimeoutExpired("claude", 5), pid=4242)
         with self.assertRaises(cs.ClaudeError) as ctx:
             self._ask(fake)
-        self.assertEqual(type(ctx.exception), cs.ClaudeError)
+        # 0.5.0 起逾時是 ClaudeError 的子類別 ClaudeTimeoutError（except ClaudeError 照樣接得到）
+        self.assertEqual(type(ctx.exception), cs.ClaudeTimeoutError)
         self.assertEqual(str(ctx.exception), "呼叫逾時（5s）。")
         proc = fake.procs[-1]
         self.assertEqual(proc.snapshot["timeout"], 5)

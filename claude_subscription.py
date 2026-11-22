@@ -75,7 +75,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 __all__ = [
     "ask",
@@ -89,6 +89,17 @@ __all__ = [
     "ClaudeUsageLimitError",
     "ClaudeIsolationUnsupportedError",
     "ClaudeNotFoundError",
+    "ClaudeTimeoutError",
+    # 統一呼叫介面（三個訂閱登入套件共用的名字，見 README「給程式呼叫」）
+    "INTERFACE_VERSION",
+    "CAPABILITIES",
+    "Result",
+    "LoginError",
+    "UsageLimitError",
+    "AuthError",
+    "NotInstalledError",
+    "CallTimeoutError",
+    "flatten_messages",
     "EXIT_OK",
     "EXIT_CALL_FAILED",
     "EXIT_NO_BINARY",
@@ -260,6 +271,15 @@ class ClaudeResult:
     duration_ms: int = 0
     session_id: str = ""
     raw: dict = field(default_factory=dict)  # 完整原始 JSON
+    model: str = ""  # 實際用的模型（從 modelUsage 取；取不到就是呼叫時要的那個）
+
+    @property
+    def usage(self) -> dict:
+        """統一格式的 token 用量：``{"input", "output", "cached_input"}``（拿不到的鍵不放；全拿不到是 ``{}``）。
+
+        ``input`` 含快取讀寫的部分、``cached_input`` 是其中讀快取的部分（跟另外兩個訂閱套件同一個算法）。
+        優先用 claude 輸出的 ``usage``，沒有就把 ``modelUsage`` 各模型加總。"""
+        return _normalize_usage(self.raw, self.model_usage)
 
     @property
     def data(self) -> Any:
@@ -273,23 +293,45 @@ class ClaudeResult:
         return json.loads(self.text)
 
 
-class ClaudeError(RuntimeError):
+class LoginError(Exception):
+    """統一呼叫介面的共同基底：這個套件丟出的每一種「叫不動」都是它的子類別（三個訂閱登入套件同名）。
+
+    ``kind``：給程式分類用的短字串——``"quota_exhausted"``（額度用完）、``"auth_invalid"``（沒登入／過期）、
+    ``"not_installed"``（找不到 claude）、``"timeout"``（逾時）、``"unsupported"``（這版 claude 缺旗標）、
+    ``"unknown"``（其他）。呼叫端給錯的參數另外丟 ``ValueError``，不在這個階層裡。"""
+
+    kind = "unknown"
+
+
+class ClaudeError(RuntimeError, LoginError):
     """呼叫失敗時丟出。對應結束碼 1。"""
 
 
 class ClaudeAuthError(ClaudeError):
     """認證失敗：沒登入、token 過期、API key 無效。對應結束碼 3。"""
 
+    kind = "auth_invalid"
+
 
 class ClaudeUsageLimitError(ClaudeError):
     """訂閱的使用額度用完了（HTTP 429、「You've hit your session limit」這類）。結束碼 1。
 
     ``resets``：Claude 說的重置時間原文（例如 ``"7pm (Asia/Taipei)"``），抓不到就是空字串。
+    ``retry_after``：幾秒後可以再試；Claude 只給時刻、不給秒數，所以目前一律是 ``None``（統一介面的欄位）。
     ``str(e)`` 是給人看的一句話，不含 claude 的原始輸出——呼叫端可以直接顯示。"""
 
-    def __init__(self, message: str, resets: str = ""):
+    kind = "quota_exhausted"
+
+    def __init__(self, message: str, resets: str = "", retry_after: Optional[float] = None):
         super().__init__(message)
         self.resets = resets
+        self.retry_after = retry_after
+
+
+class ClaudeTimeoutError(ClaudeError):
+    """呼叫逾時（``timeout`` 秒內沒跑完）。繼承 ClaudeError，所以既有的 ``except ClaudeError`` 照樣接得到。結束碼 1。"""
+
+    kind = "timeout"
 
 
 class ClaudeIsolationUnsupportedError(ClaudeError):
@@ -298,16 +340,158 @@ class ClaudeIsolationUnsupportedError(ClaudeError):
     隔離模式寧可不跑也不放寬：只要有一個旗標查不到，就丟這個例外，不會少帶幾個旗標照跑。
     ``missing``：``claude --help`` 裡找不到的旗標清單（無法讀取說明時是空的）。"""
 
+    kind = "unsupported"
+
     def __init__(self, message: str, missing: Optional[list] = None):
         super().__init__(message)
         self.missing = list(missing or [])
 
 
-class ClaudeNotFoundError(FileNotFoundError):
+class ClaudeNotFoundError(FileNotFoundError, LoginError):
     """找不到 claude 執行檔。對應結束碼 2。
 
-    繼承 FileNotFoundError 以維持與舊版程式碼的相容性。
+    繼承 FileNotFoundError 以維持與舊版程式碼的相容性；也是 LoginError（統一介面），
+    但**不是** ClaudeError——既有的 ``except ClaudeError`` 不會多接到它。
     """
+
+    kind = "not_installed"
+
+
+# --------------------------------------------------------------------------- #
+# 2b. 統一呼叫介面（三個訂閱登入套件同名：claude_subscription、github_copilot_login、chatgpt_login）
+# --------------------------------------------------------------------------- #
+INTERFACE_VERSION = "1"
+Result = ClaudeResult
+UsageLimitError = ClaudeUsageLimitError
+AuthError = ClaudeAuthError
+NotInstalledError = ClaudeNotFoundError
+CallTimeoutError = ClaudeTimeoutError
+
+# 能力照實標（給包裝的程式決定能不能用這個來源）。
+CAPABILITIES = {
+    "interface": INTERFACE_VERSION,
+    "backend": "claude -p",       # 官方 Claude Code CLI
+    "text": True,
+    "tools": False,               # 沒有 OpenAI 式 function calling（Claude Code 自己的工具不算，統一介面不開）
+    "stream": True,               # ask_stream()
+    "usage": True,
+    "cost": True,                 # ClaudeResult.cost_usd
+    "system": "native",           # --system-prompt
+    "messages": "flattened",      # 多輪訊息攤成一段文字送出（claude -p 一次只收一段）
+    "images": False,
+    "json_schema": True,
+    "default_model": "haiku",
+}
+_DEFAULT_MODEL = "haiku"
+
+_MULTI_TURN_HEAD = ("Below is a conversation between a user and an assistant. "
+                    "Reply as the assistant to the last user message, with the assistant's reply only.")
+_ROLE_HEAD = {"user": "### User", "assistant": "### Assistant"}
+
+
+def _content_text(content: Any) -> str:
+    """訊息內容 → 文字。字串原樣；OpenAI 式 parts 清單只收 type=text，其他（圖片…）丟 ValueError。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and part.get("type", "text") == "text":
+                parts.append(str(part.get("text") or ""))
+            else:
+                kind = part.get("type") if isinstance(part, dict) else type(part).__name__
+                raise ValueError(f"這個來源只收文字，不支援 {kind!r} 內容（例如圖片）。")
+        return "".join(parts)
+    raise ValueError(f"訊息內容要是字串或文字 parts 清單，收到 {type(content).__name__}。")
+
+
+def flatten_messages(messages_or_prompt: Any, system: Optional[str] = None) -> tuple:
+    """字串或訊息清單 → ``(system, prompt)``（三個訂閱登入套件的寫法一模一樣）。
+
+    * 字串：原樣當 prompt，system 照給的。
+    * 清單：每則是 dict（``role``、``content``）或有 ``.role``／``.content`` 的物件。
+      ``system`` 的內容收進 system（跟參數給的用空行接在後面）；``user``／``assistant`` 是對話；
+      其他角色（``tool``…）丟 ValueError——這個來源沒有工具呼叫。內容可以是字串或 OpenAI 式 parts（只收文字）。
+    * 只有一則 user（可以加 system）：prompt 就是那則原文。多輪：攤成一段逐字稿，最後一則必須是 user。"""
+    if isinstance(messages_or_prompt, str):
+        return system, messages_or_prompt
+    if messages_or_prompt is None or isinstance(messages_or_prompt, (bytes, dict)):
+        raise ValueError("要給字串，或訊息清單（每則有 role、content）。")
+    systems, turns = [], []
+    for msg in messages_or_prompt:
+        if isinstance(msg, dict):
+            role, content = msg.get("role"), msg.get("content")
+        else:
+            role, content = getattr(msg, "role", None), getattr(msg, "content", None)
+        role = str(role or "").lower()
+        text = _content_text(content)
+        if role == "system":
+            if text.strip():
+                systems.append(text)
+        elif role in _ROLE_HEAD:
+            turns.append((role, text))
+        else:
+            raise ValueError(f"不支援的訊息角色 {role!r}：這個來源只有 system／user／assistant，沒有工具呼叫。")
+    if not turns or turns[-1][0] != "user":
+        raise ValueError("訊息清單裡最後一則（system 以外）必須是 user。")
+    merged = "\n\n".join(s for s in ([system] if system else []) + systems) or system
+    if len(turns) == 1:
+        return merged, turns[0][1]
+    body = "\n\n".join(f"{_ROLE_HEAD[role]}\n{text}" for role, text in turns)
+    return merged, f"{_MULTI_TURN_HEAD}\n\n{body}"
+
+
+def _normalize_usage(raw: Any, model_usage: Any) -> dict:
+    """claude 的 usage（或 modelUsage）→ {"input", "output", "cached_input"}。"""
+    def num(src: dict, *keys: str) -> int:
+        total = 0
+        for key in keys:
+            try:
+                total += int(src.get(key) or 0)
+            except (TypeError, ValueError):
+                pass
+        return total
+
+    usage = raw.get("usage") if isinstance(raw, dict) else None
+    if isinstance(usage, dict) and usage:
+        cached = num(usage, "cache_read_input_tokens")
+        return {"input": num(usage, "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"),
+                "output": num(usage, "output_tokens"), "cached_input": cached}
+    if isinstance(model_usage, dict) and model_usage:
+        rows = [v for v in model_usage.values() if isinstance(v, dict)]
+        if rows:
+            return {"input": sum(num(r, "inputTokens", "cacheCreationInputTokens", "cacheReadInputTokens") for r in rows),
+                    "output": sum(num(r, "outputTokens") for r in rows),
+                    "cached_input": sum(num(r, "cacheReadInputTokens") for r in rows)}
+    return {}
+
+
+def _pick_model(model_usage: Any, asked: str) -> str:
+    """實際用的模型：modelUsage 只有一個就是它；好幾個（claude 會順手用小模型做雜事）取輸出最多的；沒有就是 asked。"""
+    if isinstance(model_usage, dict) and model_usage:
+        def out(item):
+            value = item[1] if isinstance(item[1], dict) else {}
+            try:
+                return int(value.get("outputTokens") or 0)
+            except (TypeError, ValueError):
+                return 0
+        return str(max(model_usage.items(), key=out)[0])
+    return asked
+
+
+def _with_messages(prompt: Any, system: Optional[str]) -> tuple:
+    """ask()／ask_stream() 的第一個參數可以是訊息清單：攤平，並把訊息裡的 system 併進 system 參數。
+
+    system 是內建預設（沒特別給）或 None 時，訊息裡有 system 就用訊息的；明確給了字串就把訊息的接在後面。"""
+    if isinstance(prompt, str):
+        return prompt, system
+    base = None if system is None or system is _DEFAULT_SYSTEM else system
+    merged, text = flatten_messages(prompt, base)
+    return text, (merged if merged is not None else system)
 
 
 # 預設系統提示：把 Claude 框定成純資料處理，避免多餘輸出，也省 token。
@@ -432,9 +616,9 @@ def _read_attachments(paths: list) -> str:
 # 3. 核心呼叫函式
 # --------------------------------------------------------------------------- #
 def ask(
-    prompt: str,
+    prompt: Any,
     *,
-    model: str = "haiku",
+    model: Optional[str] = None,
     system: Optional[str] = _DEFAULT_SYSTEM,
     json_schema: Optional[dict] = None,
     max_budget_usd: Optional[float] = None,
@@ -455,8 +639,8 @@ def ask(
 
     參數
     ----
-    prompt        : 你的提示 / 要整理的資料（字串）。
-    model         : 'haiku'(最便宜,預設) / 'sonnet'(均衡) / 'opus'(最強最貴) 或完整模型名。
+    prompt        : 你的提示 / 要整理的資料（字串）；也可以是訊息清單（統一介面，見 flatten_messages）。
+    model         : None＝'haiku'(最便宜,預設) / 'sonnet'(均衡) / 'opus'(最強最貴) 或完整模型名。
     system        : 系統提示。設成 None 會用 Claude Code 預設（較貴）。
                     注意：覆寫系統提示會讓 Claude **不知道自己在哪個資料夾**，
                     所以搭配工具做檔案操作時，提示裡要給絕對路徑。
@@ -498,18 +682,24 @@ def ask(
     ----
     ClaudeNotFoundError : 找不到 claude 執行檔（結束碼 2）。
     ClaudeAuthError     : 沒登入 / token 過期 / API key 無效（結束碼 3）。
+    ClaudeUsageLimitError : 訂閱額度用完（結束碼 1）。
+    ClaudeTimeoutError  : 逾時（ClaudeError 的子類別，結束碼 1）。
     ClaudeIsolationUnsupportedError : 隔離模式需要的旗標這版 claude 沒有（結束碼 1）。
     ClaudeError         : 其他呼叫失敗（結束碼 1）。
     FileNotFoundError   : 附檔不存在（結束碼 4）。
     ValueError          : auth 模式不合法、附檔不是文字檔、隔離模式參數衝突（結束碼 4）。
     """
+    prompt, system = _with_messages(prompt, system)
+    model = model or _DEFAULT_MODEL
     with _workspace(isolated) as tmp_root:
         claude, cmd, env, prompt, run_cwd = _prepare(
             prompt, "json", model=model, system=system, json_schema=json_schema,
             max_budget_usd=max_budget_usd, tools=tools, permission_mode=permission_mode, binary=binary,
             auth=auth, attach=attach, resume=resume, session_id=session_id, persist=persist,
             cwd=cwd, extra_args=extra_args, isolated=isolated, tmp_root=tmp_root)
-        return _run_json(claude, cmd, env, prompt, run_cwd, timeout, redact=isolated, kill_tree=isolated)
+        result = _run_json(claude, cmd, env, prompt, run_cwd, timeout, redact=isolated, kill_tree=isolated)
+    result.model = _pick_model(result.model_usage, model)
+    return result
 
 
 def _run_json(claude, cmd, env, prompt, cwd, timeout, *, redact: bool, kill_tree: bool = False) -> ClaudeResult:
@@ -534,7 +724,7 @@ def _run_json(claude, cmd, env, prompt, cwd, timeout, *, redact: bool, kill_tree
                 **_no_window_kwargs(),
             )
         except subprocess.TimeoutExpired as e:
-            raise ClaudeError(f"呼叫逾時（{timeout}s）。") from e
+            raise ClaudeTimeoutError(f"呼叫逾時（{timeout}s）。") from e
         except OSError as e:  # 執行檔在解析後又消失、或路徑不可執行
             raise ClaudeNotFoundError(f"無法執行 {claude}：{e}\n\n{_install_hint()}") from e
         returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
@@ -574,7 +764,7 @@ def _communicate_killing_tree(claude, cmd, env, prompt, cwd, timeout) -> tuple:
         stdout, stderr = proc.communicate(prompt, timeout=timeout)
     except subprocess.TimeoutExpired as e:
         _stop_tree(proc)
-        raise ClaudeError(f"呼叫逾時（{timeout}s）。") from e
+        raise ClaudeTimeoutError(f"呼叫逾時（{timeout}s）。") from e
     except BaseException:
         _stop_tree(proc)
         raise
@@ -593,11 +783,11 @@ def _stop_tree(proc) -> None:
 
 
 def ask_stream(
-    prompt: str,
+    prompt: Any,
     on_event: Callable[[dict], None],
     *,
     include_partial: bool = False,
-    model: str = "haiku",
+    model: Optional[str] = None,
     system: Optional[str] = _DEFAULT_SYSTEM,
     json_schema: Optional[dict] = None,
     max_budget_usd: Optional[float] = None,
@@ -627,6 +817,8 @@ def ask_stream(
     isolated=True 的意思與限制跟 ask() 相同。
     """
     stream_args = ["--verbose"] + (["--include-partial-messages"] if include_partial else [])
+    prompt, system = _with_messages(prompt, system)
+    model = model or _DEFAULT_MODEL
     with _workspace(isolated) as tmp_root:
         claude, cmd, env, prompt, run_cwd = _prepare(
             prompt, "stream-json", model=model, system=system, json_schema=json_schema,
@@ -634,7 +826,9 @@ def ask_stream(
             auth=auth, attach=attach, resume=resume, session_id=session_id, persist=persist,
             cwd=cwd, extra_args=extra_args, isolated=isolated, tmp_root=tmp_root,
             stream_args=stream_args)
-        return _run_stream(claude, cmd, env, prompt, run_cwd, timeout, on_event, redact=isolated)
+        result = _run_stream(claude, cmd, env, prompt, run_cwd, timeout, on_event, redact=isolated)
+    result.model = _pick_model(result.model_usage, model)
+    return result
 
 
 def _run_stream(claude, cmd, env, prompt, cwd, timeout, on_event, *, redact: bool) -> ClaudeResult:
@@ -705,7 +899,7 @@ def _run_stream(claude, cmd, env, prompt, cwd, timeout, on_event, *, redact: boo
     stderr = "".join(stderr_parts)
     stdout = "\n".join(lines)
     if timed_out.is_set():
-        raise ClaudeError(f"呼叫逾時（{timeout}s）。")
+        raise ClaudeTimeoutError(f"呼叫逾時（{timeout}s）。")
     if final is None:
         if proc.returncode != 0:
             _raise_process_failure(proc.returncode, stderr, stdout, redact=redact)

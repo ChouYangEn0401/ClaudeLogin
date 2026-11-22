@@ -5,6 +5,24 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-23
+
+### Added
+- 統一呼叫介面（`INTERFACE_VERSION = "1"`；`github_copilot_login`、`chatgpt_login` 用同一組名字），給多來源的 LLM 函式庫包裝用：
+  - `ask()`／`ask_stream()` 的第一個參數可以是訊息清單（`role`＋`content`，content 可為字串或只含文字的 parts）；system 併進系統提示，多輪攤成一段逐字稿。`tool` 角色、圖片、最後一則不是 user 丟 `ValueError`。
+  - `flatten_messages(messages, system=None) -> (system, prompt)`。
+  - `ClaudeResult.usage`（`{"input", "output", "cached_input"}`）與 `ClaudeResult.model`（實際用的模型，取自 `modelUsage`）。
+  - 新的共同基底 `LoginError`（每種錯誤都有 `.kind`）；別名 `Result`、`UsageLimitError`、`AuthError`、`NotInstalledError`、`CallTimeoutError`。
+  - `ClaudeUsageLimitError.retry_after`（Claude 只給時刻，目前一律 `None`）。
+  - `CAPABILITIES`：能力照實標（沒有 function calling、不收圖、有串流、多輪是攤平的）。
+  - `tests/test_interface.py`。
+- `ClaudeTimeoutError`（`ClaudeError` 的子類別）：逾時改丟它。
+
+### Changed
+- `ask()`／`ask_stream()` 的 `model` 預設改成 `None`（＝`"haiku"`，行為不變）。
+- `ClaudeError` 多繼承 `LoginError`、`ClaudeNotFoundError` 多繼承 `LoginError`；舊的 `except` 行為不變（`ClaudeNotFoundError` 仍**不是** `ClaudeError`）。
+- **型別細節**：逾時的例外型別從 `ClaudeError` 變成它的子類別 `ClaudeTimeoutError`；`except ClaudeError` 照樣接得到，只有用 `type(e) is ClaudeError` 精確比對的程式要改。`tests/test_isolated.py` 對應的斷言跟著改。
+
 ## [0.4.1] - 2026-11-19
 
 ### Fixed
