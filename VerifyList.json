@@ -1,0 +1,25 @@
+{
+  "schema": "verifylist/1",
+  "items": [
+    {
+      "id": "unit-tests",
+      "what": "離線測試（假的子程序，不叫真的 CLI、不連網）",
+      "run": [
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests"
+      ],
+      "cwd": ".",
+      "env": {},
+      "expect": "exit 0",
+      "needs": [],
+      "since": "2026-11-23",
+      "status": "pass",
+      "last_run": "2026-11-23",
+      "last_result": "195 tests OK"
+    }
+  ]
+}
