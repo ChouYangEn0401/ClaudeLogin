@@ -75,7 +75,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 __all__ = [
     "ask",

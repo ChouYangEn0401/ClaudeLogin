@@ -11,7 +11,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "629SandBoxEntity" }]
+authors = [{ name = "ChouYangEn0401" }]
 keywords = ["claude", "anthropic", "claude-code", "cli", "llm", "subscription"]
 dependencies = []              # 純標準函式庫，無任何相依
 classifiers = [
