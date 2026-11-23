@@ -184,6 +184,7 @@ except LoginError as e:                          # 其他叫不動的情況；e.
    - ❌ 把訂閱 OAuth **token 抽出來自己直接打 Anthropic API**（OpenClaw / OpenCode 那類自製 harness）→ **明確禁止**。
    - 散佈給別人：請對方在自己電腦裝官方 Claude Code、用自己帳號登入；**切勿散佈你的 token / 憑證**。
      要大規模 / 商業散佈，最無爭議的是讓每位使用者**自備 API key**（`--auth apikey`）。
+   - 拿自己的訂閱服務別人：不推薦；條款由你自己確認，見文末〈[訂閱登入的使用聲明](#訂閱登入的使用聲明)〉。
 
 3. **登入方式可選（`--auth` / `auth=`）。** 預設 `subscription` 會在呼叫前清掉子程序環境裡的
    `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`（避免被按量計費搶走），**以及**
@@ -644,6 +645,29 @@ python -m venv .venv
 - `pyproject.toml` — 打包設定，`pip install .` 後可用 `claude-sub` 指令。
 - `LICENSE` — MIT。
 - `README.md` — 本說明。
+
+---
+
+## 訂閱登入的使用聲明
+
+本套件呼叫**你自己在這台電腦上已登入的官方 `claude` 命令列**，用的是你個人的 Claude 訂閱帳號。給程式用的時候（例如經 ntu_easy_llm 的 `remote/subscription/*` 來源，或把它接進 agent 外殼），目錄與設定頁上標「只給本人使用」。
+
+1. **不推薦拿個人訂閱服務別人**：不建議把個人訂閱拿來服務其他人、轉售、共用或分享出去——例如經 LLOP 之類的通道提供給別人、放進給訪客使用的 AI 功能，或放進給別人用的備援鏈。
+2. **條款由你自己確認**：Claude 有自己的使用條款與政策。某種用法是否被允許，請你自己閱讀並理解該服務的條款，並自行負責。
+3. **本專案只提供技術介面**：本專案及其作者、維護者不代表任何服務商，與你如何使用自己的訂閱無關，也不對違反服務條款所造成的後果（例如帳號被限制或停用）負責。程式技術上不阻擋任何用法，但「沒被擋」不代表服務商允許。
+4. 這段是對 MIT 授權中「按現狀提供、不附任何擔保」的補充說明，不是額外的授權條件。
+
+<details>
+<summary>English version</summary>
+
+**Usage notice for subscription login.** This package calls the official `claude` CLI that **you** have signed in to on your own machine, using your personal Claude subscription. When used from other programs (for example the `remote/subscription/*` sources of ntu_easy_llm, or an agent shell), it is labelled "for personal use only".
+
+1. **Not recommended for serving others.** We do not recommend using a personal subscription to serve other people, or to resell, pool or share access — for example through a relay channel such as LLOP, an AI feature offered to guests, or a fallback chain used by other people.
+2. **You check the terms.** Claude has its own terms of use and policies. Whether a particular use is allowed is for you to read, understand and take responsibility for.
+3. **Technical interface only.** This project and its authors and maintainers do not represent any service provider, are not involved in how you use your subscription, and are not responsible for the consequences of violating a provider's terms (such as account restrictions or suspension). The code does not technically block any use; not being blocked does not mean a use is permitted by the provider.
+4. This notice supplements the "as is, without warranty" clause of the MIT License; it is not an additional license condition.
+
+</details>
 
 ---
 
