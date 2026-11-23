@@ -1,5 +1,7 @@
 # 用 Claude 訂閱（或 API key）在程式裡呼叫 Claude
 
+第一次用？看 [docs/TUTORIAL.md](docs/TUTORIAL.md)
+
 讓你的其他程式呼叫 Claude，可走**已付費的訂閱（Pro / Max）**或 **API key**。
 核心原理是把**官方 Claude Code 執行檔**當子程序呼叫（`claude -p` headless 模式）——
 請求一律「經過官方 Claude Code」，用的就是該台電腦上 Claude Code 設定的登入方式。
