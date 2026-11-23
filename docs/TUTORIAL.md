@@ -59,12 +59,12 @@
    Python 3.12.8
    ```
 
-   數字要是 **3.9 或更新**。
+   這個套件 3.9 以上就能跑，但**建議 3.11 或更新**：之後如果要用 ntu_easy_llm 或 LLOP，它們要 3.11，先裝新版就不用重裝。
 
 4. **不是這樣怎麼辦**：
    - 看到 `Python was not found` 或「無法辨識 'python' 詞彙」：還沒裝。到 <https://www.python.org/downloads/> 下載 Windows 安裝檔，
      安裝畫面第一頁**一定要勾「Add python.exe to PATH」**，再按 Install。裝好後**關掉 PowerShell 再開一個新的**，重打一次上面的指令。
-   - 版本比 3.9 舊：照上面的方法裝新版。
+   - 版本比 3.11 舊：照上面的方法裝新版。
 
 ### 步驟 3：安裝官方 Claude Code
 
@@ -84,8 +84,24 @@
    會印出一行版本號（一串數字）。
 
 4. **不是這樣怎麼辦**：
-   - 重開視窗後 `claude --version` 還是說「無法辨識 'claude' 詞彙」：重新開機一次再試。
-   - 也可以改裝 VS Code 的擴充功能「Anthropic.claude-code」，這個套件也找得到它。
+   - 重開視窗後 `claude --version` 還是說「無法辨識 'claude' 詞彙」：如果安裝訊息沒有錯誤，可以試著用完整路徑直接執行：
+
+     ```powershell
+     & "$HOME\.local\bin\claude.exe" --version
+     ```
+
+     有印出版本號的話，代表裝好了、只是 PowerShell 還不知道它在哪。可以把 `$HOME\.local\bin` 加進 PATH（Windows 的「編輯使用者的環境變數」→ `Path` → 新增），
+     或重新開機一次再試。（這個資料夾是官方安裝程式常見的位置，以你電腦上的安裝訊息為準。）
+     這個套件自己也會去 `$HOME\.local\bin` 找 `claude`，所以就算 PowerShell 找不到，步驟 8 的自我檢查仍可能顯示 `✓ 找到 claude`；
+     但步驟 4 要在 PowerShell 打 `claude` 登入，那時就用上面的完整路徑寫法：`& "$HOME\.local\bin\claude.exe"`。
+   - 如果出現要你先安裝 Git（或 Git Bash）的錯誤，可以試著裝 Git，裝完**關掉 PowerShell 重開**，再做一次這一步：
+
+     ```powershell
+     winget install Git.Git
+     ```
+
+     第一次用 winget 時，它可能會用英文問你是否同意條款（結尾是 `[Y] Yes  [N] No`），打 `Y` 按 Enter。
+   - 注意：VS Code 的 Claude Code 擴充功能**不會**在 PowerShell 裡加 `claude` 指令，這份教學要的是上面這個命令列版本。
 
 ### 步驟 4：在終端機登入 Claude
 
@@ -96,8 +112,13 @@
    claude
    ```
 
-3. **會看到什麼**：Claude Code 會帶你選登入方式，並打開瀏覽器。在瀏覽器登入你的 Claude 帳號、按允許。
-   回到終端機，畫面會變成可以打字跟 Claude 聊天的樣子。打 `/exit` 按 Enter 離開，回到 `PS ...>`。
+3. **會看到什麼**：第一次執行會問你幾個問題（實際的字以畫面為準，大概是這幾個）：
+   - 先問畫面的佈景主題（顏色）：隨便選一個，按 Enter。
+   - 問登入方式：選**用 Claude 帳號登入（訂閱）**那一個，不要選 API key 那一個。
+   - 打開瀏覽器：在瀏覽器登入你的 Claude 帳號、按允許，再回到終端機。
+   - 問要不要信任目前這個資料夾：選 **Yes**。
+
+   最後畫面會變成可以打字跟 Claude 聊天的樣子。打 `/exit` 按 Enter 離開，回到 `PS ...>`。
 4. **不是這樣怎麼辦**：
    - 瀏覽器沒有自己打開：終端機上會有一個網址，把它複製到瀏覽器打開。
    - 這台電腦沒有瀏覽器（例如伺服器）：改用 `claude setup-token`，見 README 的「新電腦設定」。
